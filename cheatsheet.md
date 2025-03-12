@@ -64,10 +64,10 @@ This guide is tailored for working with MLX, a machine learning framework optimi
   Example: `mx.add(arr1, arr2)`.
 - **Conditional Selection**: `mx.where(condition, x, y)` picks values, requires 3 arguments, and must be broadcast-compatible.  
   Example: `mx.where(arr > 0, arr, mx.full(arr.shape, 0, arr.dtype))`.
-  - Note: Unlike NumPy’s `np.where(condition)`, it doesn’t return indices.
+  - Note: Unlike NumPy's `np.where(condition)`, it doesn't return indices.
 - **Sorting**: `mx.argsort(arr)` sorts ascending. For descending, use `mx.argsort(arr)[::-1]`.  
   Example: `top_indices = mx.argsort(arr)[::-1][:5]`.
-- **Rounding**: Use `mx.round(arr)` for array rounding, not Python’s `round()`.  
+- **Rounding**: Use `mx.round(arr)` for array rounding, not Python's `round()`.  
   Example: `n_un = mx.round(mx.array(3.7)).item()` → `4`.
 - **Dtype as String**: Use `str(dtype)`. Example: `str(mx.float32)` → `"float32"`. Avoid `dtype.__name__`.
 
@@ -114,10 +114,10 @@ MLX uses **just-in-time (JIT) compilation** via `mx.compile()` for graph optimiz
 
 ### Conversion to Other Frameworks
 - **To NumPy**: `np.array(mx_array)`. Example: `np_arr = np.array(mx_arr)`.  
-  - **Warning**: Cast `bfloat16` to `float32` first (e.g., `mx_arr.astype(mx.float32)`), as NumPy doesn’t support `bfloat16` natively, to avoid precision issues.
+  - **Warning**: Cast `bfloat16` to `float32` first (e.g., `mx_arr.astype(mx.float32)`), as NumPy doesn't support `bfloat16` natively, to avoid precision issues.
 - **From NumPy**: `mx.array(np_array)`. Example: `mx_arr = mx.array(np_arr)`.
 - **To PyTorch**: Use `torch.tensor(memoryview(mx_arr))` or via NumPy if necessary.  
-  - **Conv Weight Reshaping**: For 1D convolutions, MLX weights `[out_channels, kernel_size, in_channels]` need permuting to PyTorch’s `[out_channels, in_channels, kernel_size]`:
+  - **Conv Weight Reshaping**: For 1D convolutions, MLX weights `[out_channels, kernel_size, in_channels]` need permuting to PyTorch's `[out_channels, in_channels, kernel_size]`:
     ```python
     mlx_weights = mlx_conv.weight
     torch_weights = torch.from_numpy(np.array(mlx_weights)).permute(0, 2, 1)
@@ -199,5 +199,13 @@ MLX uses **just-in-time (JIT) compilation** via `mx.compile()` for graph optimiz
 
 ---
 
+### Making MLX Go Fast
+- Graph Evaluation: Avoid overly frequent evaluations to prevent expensive graph rebuilds. Evaluate your computation graphs at logical iteration boundaries (e.g., after a full training iteration). For latency-sensitive tasks, consider using `mx.async_eval` to pipeline computations.
+- Type Promotion: Be cautious of unintended upcasting. For example, operations like `mx.array(1.0, mx.float32) * mx.array(2.0, mx.float16)` result in `mx.float32`. Use Python scalars when multiplying to preserve the array's type.
+- Fast Operations: Leverage optimized ops from the `mx.fast` namespace (e.g., `mx.fast.rms_norm`, `mx.fast.layer_norm`, `mx.fast.rope`, `mx.fast.scaled_dot_product_attention`) and use efficient computation patterns (e.g., prefer `x @ W.T` for vector-matrix multiplications).
+- Compilation: Use `mx.compile()` for JIT compilation to accelerate graph execution. Be mindful that changes in input shapes or constant inputs trigger recompilations; for closures, explicitly pass arrays as inputs or use partial decoration.
+- Memory Use: Utilize lazy loading by passing file paths to `mx.load` and cast arrays to lower precision (like `mx.float16`) before evaluation to reduce peak memory usage. Also, release temporary variables early in loops to free memory.
+- Profiling: Monitor GPU utilization (e.g., via mactop) and use the Metal debugger to identify and resolve performance bottlenecks.
+
 ### Notes
-MLX’s indexing is stricter than NumPy’s flexible approach, requiring explicit tensor construction with integral types. This aligns with Metal’s GPU optimization but demands careful dtype and indexing management. Avoid assumptions about NumPy-like behavior (e.g., dynamic slicing, `argwhere`, `nonzero`, `dtype.__name__`)—they’re not supported yet. Use this updated guide to ensure accurate, performant MLX code.
+MLX's indexing is stricter than NumPy's flexible approach, requiring explicit tensor construction with integral types. This aligns with Metal's GPU optimization but demands careful dtype and indexing management. Avoid assumptions about NumPy-like behavior (e.g., dynamic slicing, `argwhere`, `nonzero`, `dtype.__name__`)—they're not supported yet. Use this updated guide to ensure accurate, performant MLX code.

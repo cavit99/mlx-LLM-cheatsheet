@@ -1,787 +1,1052 @@
 """
-MLX Array Indexing Validation Script
+Source-backed MLX / MLX-LM verifier.
 
-This script comprehensively tests and validates MLX array indexing behaviors,
-focusing on proper usage patterns, edge cases, and performance characteristics.
-It covers:
-- Basic array indexing with various mask types
-- Slice assignment operations
-- Edge cases and error conditions
-- NumPy-like behavior comparison
-- Boolean indexing workarounds
-- Framework conversion (MLX ↔ NumPy/PyTorch)
-- Performance benchmarks and compilation tests
+This script checks the high-signal claims in cheatsheet.md against a compact set
+of local runtime assertions. It is intentionally small and correctness-focused:
+no model downloads, no giant benchmarks, and no undocumented conclusions passed
+off as contracts.
 
-Results are summarized at the end of output to provide a clear overview
-of supported operations and recommended practices.
+Baseline used for this repo revision:
+- MLX v0.31.0
+- MLX-LM v0.31.0
+
+Runtime notes:
+- A newer version than the baseline is reported as a warning, not an outright
+  failure, because some checks may still hold while the docs drift.
+- Out-of-bounds indexing is printed as an observed behavior note only. Upstream
+  documents it as undefined behavior.
 """
 
+from __future__ import annotations
+
+import argparse
+import importlib
+import inspect
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from typing import Callable, Iterable
+
 import mlx.core as mx
-import time
-import numpy as np  
-try:
-    import torch  # Try to import PyTorch for comparison
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
+import mlx.nn as nn
+import numpy as np
 
-# Helper to display arrays and their properties
-def print_array(label, arr, extra_info=""):
-    """Print array information in a readable format with sample values for large arrays."""
-    if arr is None:
-        print(f"{label}: None (Failed to create)")
-    # Check if the result is a Python scalar
-    elif isinstance(arr, (int, float, bool)):
-        print(f"{label}: {arr} (Python {type(arr).__name__})")
-    # Special case for ArrayAt objects which don't have size, shape, etc.
-    elif hasattr(arr, '__class__') and arr.__class__.__name__ == 'ArrayAt':
-        print(f"{label}: {type(arr).__name__} object (Use with .add(), .subtract(), etc.)")
-    else:
-        if arr.size > 10:
-            # For 1D or flattened arrays, take first 5 elements directly
-            if len(arr.shape) == 1:
-                sample = [str(float(x)) if x.dtype in (mx.float32, mx.float64, mx.bfloat16) else str(int(x)) 
-                          for x in arr[:5]]
-            else:
-                # For 2D+, flatten first to avoid multi-element arrays
-                flat_sample = arr.flatten()[:5]
-                sample = [str(float(x)) if x.dtype in (mx.float32, mx.float64, mx.bfloat16) else str(int(x)) 
-                          for x in flat_sample]
-            print(f"{label}: array([{', '.join(sample)}, ...], dtype={arr.dtype})")
-        else:
-            print(f"{label}: {arr}")
-        print(f"  Shape: {arr.shape}, Dtype: {arr.dtype}, Size: {arr.size}")
-    if extra_info:
-        print(f"  {extra_info}")
-    print()
+BASELINE_MLX = "0.31.0"
+BASELINE_MLX_LM = "0.31.0"
 
-# Helper to run a test case, catch failures, and measure time
-def run_test(description, func, results_dict, key):
-    """Execute a test function, measure performance, and record results."""
-    print(f"Testing: {description}")
-    tic = time.perf_counter()
+STATUS_ORDER = {"PASS": 0, "WARN": 1, "FAIL": 2}
+
+
+@dataclass
+class Result:
+    status: str
+    name: str
+    detail: str
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+
+
+def compare_version(actual: str, baseline: str) -> str:
+    actual_t = version_tuple(actual)
+    baseline_t = version_tuple(baseline)
+    if actual_t < baseline_t:
+        return "older"
+    if actual_t > baseline_t:
+        return "newer"
+    return "equal"
+
+
+def arrays_equal(left: mx.array, right: mx.array) -> bool:
+    return bool(mx.array_equal(left, right).item())
+
+
+def run_check(name: str, fn: Callable[[], Result]) -> Result:
     try:
-        result = func()
-        elapsed = (time.perf_counter() - tic) * 1000  # ms
-        print(f"  Success: Completed in {elapsed:.2f} ms")
-        results_dict[key] = {"success": True, "result": result, "time": elapsed}
-        return result
-    except Exception as e:
-        elapsed = (time.perf_counter() - tic) * 1000
-        print(f"  Failed: {type(e).__name__} - {str(e)} (in {elapsed:.2f} ms)")
-        results_dict[key] = {"success": False, "error": f"{type(e).__name__}: {str(e)}", "time": elapsed}
-        return None
-
-# Print MLX version
-print(f"MLX Version: {mx.__version__}\n")
-
-# --- Array Indexing Analysis ---
-print("=== Array Indexing Analysis ===")
-print("Exploring indexing behaviors across 1D and 2D arrays\n")
-
-arr_1d = mx.arange(10000, dtype=mx.float32) - 5000
-arr_2d = mx.arange(10000, dtype=mx.float32).reshape(100, 100) - 5000
-empty_arr = mx.array([], dtype=mx.float32)
-print_array("1D Array", arr_1d)
-print_array("2D Array", arr_2d)
-print_array("Empty Array", empty_arr)
-
-masks_1d = {
-    "All Elements Positive": arr_1d > -6000,
-    "No Elements Positive": arr_1d > 6000,
-    "Some Elements Positive": arr_1d > 0,
-    "Empty Mask": empty_arr > 0
-}
-masks_2d = {
-    "All Elements Positive": arr_2d > -6000,
-    "Some Elements Positive": arr_2d > 0
-}
-
-results = {
-    "indexing": {}, 
-    "assignment": {}, 
-    "edge_cases": {}, 
-    "workarounds": {},
-    "performance": {},
-    "laziness": {},
-    "conversion": {},
-    "buffer_prealloc": {},
-    "compiled_index": {}
-}
-
-# 1D Indexing Tests
-for mask_name, mask in masks_1d.items():
-    print(f"--- 1D Indexing with {mask_name} ---")
-    print_array("Mask", mask)
-    key_prefix = f"1d_{mask_name.lower().replace(' ', '_')}"
-
-    result = run_test("Direct Mask Indexing", lambda: arr_1d[mask], results["indexing"], f"{key_prefix}_direct")
-    print_array("Result", result)
-
-    indices = run_test("Mask-to-Indices with Placeholder and Slice", 
-                       lambda: mx.take(mx.arange(arr_1d.size), mx.where(mask, mx.arange(arr_1d.size), -1))[:-1],
-                       results["indexing"], f"{key_prefix}_placeholder_slice_indices")
-    print_array("Indices", indices)
-    result = run_test("Filtered with Placeholder and Slice", 
-                      lambda: arr_1d[indices] if indices is not None else None,
-                      results["indexing"], f"{key_prefix}_placeholder_slice_filtered")
-    print_array("Result", result)
-
-    indices = run_test("Single-Argument mx.where", lambda: mx.where(mask)[0],
-                       results["indexing"], f"{key_prefix}_single_where")
-    print_array("Indices", indices)
-
-    indices_all = mx.arange(arr_1d.size, dtype=mx.int32)
-    where_result = run_test("Three-Argument mx.where with Placeholder", 
-                            lambda: mx.where(mask, indices_all, -1 * mx.ones_like(indices_all)),
-                            results["indexing"], f"{key_prefix}_three_where")
-    print_array("Indices (including placeholders)", where_result)
-    if where_result is not None:
-        mask_sum = mx.sum(mask).item()
-        valid_indices = run_test("Extract Valid Indices (Sum-Based)", 
-                                 lambda: indices_all[:mask_sum] if mask_sum > 0 else mx.array([], dtype=mx.int32),
-                                 results["indexing"], f"{key_prefix}_valid_indices")
-        print_array("Valid Indices", valid_indices)
-        result = run_test("Filtered with Valid Indices", 
-                          lambda: arr_1d[valid_indices] if valid_indices is not None else None,
-                          results["indexing"], f"{key_prefix}_valid_filtered")
-        print_array("Result", result)
-
-    indices = run_test("Nonzero Function", lambda: mx.nonzero(mask),
-                       results["indexing"], f"{key_prefix}_nonzero")
-    print_array("Indices", indices)
-
-# 2D Indexing Tests
-for mask_name, mask in masks_2d.items():
-    print(f"--- 2D Indexing with {mask_name} ---")
-    print_array("Mask", mask)
-    key_prefix = f"2d_{mask_name.lower().replace(' ', '_')}"
-
-    result = run_test("Direct Mask Indexing", lambda: arr_2d[mask],
-                      results["indexing"], f"{key_prefix}_direct")
-    print_array("Result", result)
-
-    flat_arr = arr_2d.flatten()
-    flat_mask = mask.flatten()
-    indices_all = mx.arange(flat_arr.size, dtype=mx.int32)
-    where_result = run_test("Three-Argument mx.where on Flattened Array", 
-                            lambda: mx.where(flat_mask, indices_all, -1 * mx.ones_like(indices_all)),
-                            results["indexing"], f"{key_prefix}_three_where_flat")
-    print_array("Flat Indices (including placeholders)", where_result)
-    if where_result is not None:
-        mask_sum = mx.sum(flat_mask).item()
-        valid_indices = run_test("Extract Valid Indices from Flat (Sum-Based)", 
-                                 lambda: indices_all[:mask_sum] if mask_sum > 0 else mx.array([], dtype=mx.int32),
-                                 results["indexing"], f"{key_prefix}_valid_indices_flat")
-        print_array("Valid Flat Indices", valid_indices)
-        result = run_test("Filtered Flat Array", 
-                          lambda: flat_arr[valid_indices] if valid_indices is not None else None,
-                          results["indexing"], f"{key_prefix}_valid_filtered_flat")
-        print_array("Result (flattened)", result)
-
-# --- Slice Assignment Analysis ---
-print("\n=== Slice Assignment Analysis ===")
-buffer = mx.zeros((10000,), dtype=mx.int32)
-print_array("Initial Buffer", buffer)
-
-indices_normal = mx.arange(0, 3000, 2, dtype=mx.int32)
-indices_large = mx.arange(0, 5000, 2, dtype=mx.int32)
-indices_dynamic = mx.arange(0, 2000, 4, dtype=mx.int32)
-indices_float = mx.arange(0, 3000, 2, dtype=mx.float32)
-indices_empty = mx.array([], dtype=mx.int32)
-indices_out = mx.array([1], dtype=mx.int32)
-
-result = run_test("Assign Normal-Length Indices", 
-                  lambda: [buffer.__setitem__(slice(0, 1500), indices_normal), buffer][1],
-                  results["assignment"], "normal_length")
-print_array("Buffer After Normal Assignment", result)
-
-result = run_test("Assign Over-Length Indices", 
-                  lambda: [buffer.__setitem__(slice(0, 1500), indices_large), buffer][1],
-                  results["assignment"], "over_length")
-print_array("Buffer After Over-Length Assignment", result)
-
-result = run_test("Concatenate Dynamic Indices", 
-                  lambda: mx.concatenate([indices_dynamic, mx.zeros(10000 - indices_dynamic.size, dtype=mx.int32)]),
-                  results["assignment"], "dynamic_concat")
-print_array("Buffer After Concatenation", result)
-
-result = run_test("Assign Float Indices", 
-                  lambda: [buffer.__setitem__(slice(0, 1500), indices_float), buffer][1],
-                  results["assignment"], "float_indices")
-print_array("Buffer After Float Assignment", result)
-
-result = run_test("Assign Empty Indices", 
-                  lambda: [buffer.__setitem__(slice(0, 0), indices_empty), buffer][1],
-                  results["assignment"], "empty_indices")
-print_array("Buffer After Empty Assignment", result)
-
-result = run_test("Assign Beyond Bounds", 
-                  lambda: [buffer.__setitem__(slice(10000, None), indices_out), buffer][1],
-                  results["assignment"], "beyond_bounds")
-print_array("Buffer After Beyond Bounds", result)
-
-# Test assignment using standard slice syntax
-result = run_test("Assign with Standard Syntax", 
-                  lambda: [buffer.__setitem__(slice(5000, 5010), mx.full((10,), 99, dtype=mx.int32)), buffer][1],
-                  results["assignment"], "standard_assign")
-print_array("Buffer After Standard Assignment", result)
-
-# Test the .at API properly - using it for in-place operations with duplicate indices
-print("\n--- .at API Tests ---")
-base_array = mx.zeros((5,), dtype=mx.int32)
-print_array("Initial Array", base_array)
-
-duplicate_indices = mx.array([0, 2, 0, 2, 4], dtype=mx.int32)
-print_array("Duplicate Indices", duplicate_indices)
-
-# Test standard assignment (ignores duplicates)
-result_standard = run_test("Standard Assignment with Duplicates", 
-                 lambda: [arr := mx.zeros((5,), dtype=mx.int32), 
-                         arr.__setitem__(duplicate_indices, mx.ones_like(duplicate_indices)),
-                         arr][2],
-                 results["assignment"], "standard_duplicate")
-print_array("Result with Standard Assignment", result_standard)
-
-# Test .at.add() with duplicates (correctly applies all updates)
-result_at = run_test("Using .at.add() with Duplicates", 
-                    lambda: [arr := mx.zeros((5,), dtype=mx.int32), 
-                            arr := arr.at[duplicate_indices].add(1),
-                            mx.eval(arr),
-                            arr][3],
-                    results["assignment"], "at_add_duplicate")
-print_array("Result with .at.add()", result_at)
-
-# Test other .at operations
-result_multiply = run_test("Using .at.multiply() with Duplicates",
-                         lambda: [arr := mx.ones((5,), dtype=mx.int32) * 2, 
-                                 arr := arr.at[duplicate_indices].multiply(2),
-                                 mx.eval(arr),
-                                 arr][3],
-                         results["assignment"], "at_multiply_duplicate")
-print_array("Result with .at.multiply()", result_multiply)
-
-# Test reference handling (modify one reference, check if other is affected)
-a = mx.arange(10000, dtype=mx.int32)
-b = a  # b references the same array as a
-result = run_test("Modify Reference and Check", 
-                 lambda: [a.__setitem__(slice(0, 5000), mx.full((5000,), 42, dtype=mx.int32)), (a, b)][1],
-                 results["assignment"], "reference_modify")
-print_array("Modified Array", result[0])
-print_array("Referenced Array", result[1])
-
-# --- Edge Case Analysis ---
-print("\n=== Edge Case Analysis ===")
-
-# Test indexing beyond array bounds
-result = run_test("Index Beyond Bounds", lambda: arr_1d[10000],
-                  results["edge_cases"], "beyond_bounds")
-print_array("Result", result)
-
-# Test dynamic slicing with Python variables (mentioned in docs as a limitation)
-n = 5  # A Python int
-result = run_test("Dynamic Slicing with Python Variable", 
-                 lambda: arr_1d[:n],  # This may fail with ValueError about slice indices
-                 results["edge_cases"], "dynamic_slice_python_var")
-print_array("Result", result)
-
-# Test multiple indices beyond bounds
-multi_out_indices = mx.array([10000, 10001], dtype=mx.int32)
-result = run_test("Multi-Index Beyond Bounds", 
-                 lambda: arr_1d[multi_out_indices],  # Check if returns array or scalar
-                 results["edge_cases"], "multi_beyond_bounds")
-print_array("Result", result)
-
-# Test indexing with float values (should be rejected as non-integral)
-float_indices = mx.arange(0, 3000, 2, dtype=mx.float32) / 2
-result = run_test("Index with Float Values", lambda: arr_1d[float_indices],
-                  results["edge_cases"], "float_indices")
-print_array("Result", result)
-
-# Test lazy evaluation impact on indexing
-lazy_arr = arr_1d + 1  # Creates lazy expression, not evaluated yet
-indices = mx.arange(0, 2000, 4, dtype=mx.int32)
-result = run_test("Index Unevaluated Array", lambda: lazy_arr[indices],
-                  results["edge_cases"], "lazy_unevaluated")
-print_array("Result Before Evaluation", result)
-
-# Force evaluation and test again
-mx.eval(lazy_arr)
-result = run_test("Index Evaluated Array", lambda: lazy_arr[indices],
-                  results["edge_cases"], "lazy_evaluated")
-print_array("Result After Evaluation", result)
-
-# Test float indices in assignment operations
-buffer_float_test = mx.zeros((1500,), dtype=mx.int32)
-result = run_test("Assign Float Indices to Buffer", 
-                 lambda: [buffer_float_test.__setitem__(slice(0, 1500), float_indices), buffer_float_test][1],
-                 results["assignment"], "float_indices_assign")
-print_array("Buffer After Float Indices Assignment", result)
-
-# --- NumPy-like Behavior Checks ---
-print("\n=== NumPy-like Behavior Checks ===")
-
-# Test 2D slice flattening (check if similar to NumPy)
-result = run_test("2D Slice Flattening (like NumPy arr[:5])", 
-                  lambda: arr_2d[:5].flatten()[:5],  # NumPy would flatten directly
-                  results["edge_cases"], "2d_slice_flatten")
-print_array("Result", result)
-
-# Test scalar extraction properly
-result = run_test("Scalar Extraction from Slice (like NumPy arr[0, 0])", 
-                  lambda: arr_2d[0, 0].item(),  # Extract and convert to Python scalar with .item()
-                  results["edge_cases"], "scalar_extract")
-print_array("Result", result)
-
-# Test direct scalar extraction without .item()
-result = run_test("Direct Scalar Access (without .item())", 
-                  lambda: arr_2d[0, 0],  # Direct access returns mx array scalar
-                  results["edge_cases"], "direct_scalar")
-print_array("Result", result)
-
-# --- Boolean Indexing Workarounds ---
-print("\n=== Boolean Indexing Workarounds ===")
-
-# Create a simple boolean mask for testing
-mask_pos = arr_1d > 0  # True for positive elements
-print_array("Boolean Mask (arr_1d > 0)", mask_pos)
-
-# Workaround 1: Using mx.where with sum-based slicing
-result = run_test("Workaround: mx.where with sum-based slicing", 
-                 lambda: [indices_all := mx.arange(arr_1d.size, dtype=mx.int32), 
-                          mask_sum := mx.sum(mask_pos).item(),
-                          indices_all[:mask_sum] if mask_sum > 0 else mx.array([], dtype=mx.int32)][2],
-                 results["workarounds"], "where_sum_based")
-print_array("Valid Indices from mx.where", result)
-
-# Filter the original array with the valid indices
-filtered = run_test("Filter Original Array with Valid Indices", 
-                   lambda: arr_1d[result] if result is not None else None,
-                   results["workarounds"], "filtered_where")
-print_array("Filtered Result", filtered)
-
-# Workaround 2: Using mx.where with placeholder and slice
-result_placeholder = run_test("Workaround: mx.where with placeholder and slice", 
-                             lambda: [indices_all := mx.arange(arr_1d.size, dtype=mx.int32), 
-                                      mx.where(mask_pos, indices_all, -1 * mx.ones_like(indices_all))[:-1]][1],
-                             results["workarounds"], "where_placeholder")
-print_array("Indices from mx.where with Placeholder", result_placeholder)
-
-# Filter the original array with placeholder indices
-filtered_placeholder = run_test("Filter Original Array with Placeholder Indices", 
-                               lambda: arr_1d[result_placeholder] if result_placeholder is not None else None,
-                               results["workarounds"], "filtered_where_placeholder")
-print_array("Filtered Result with Placeholder", filtered_placeholder)
-
-# Workaround 3: Using argsort for top-n selection
-top_n = 5
-result = run_test("Workaround: argsort for top-n", 
-                 lambda: mx.argsort(arr_1d)[::-1][:top_n],  # Get indices of top n values
-                 results["workarounds"], "argsort_top_n")
-print_array(f"Top {top_n} Indices via argsort", result)
-
-# Extract the top values using the indices
-top_values = run_test("Extract Top Values via argsort", 
-                     lambda: mx.take(arr_1d, result) if result is not None else None,
-                     results["workarounds"], "top_values")
-print_array(f"Top {top_n} Values", top_values)
-
-# Workaround 4: Multi-axis coordinate indexing
-result = run_test("Multi-Axis Coordinate Indexing", 
-                 lambda: [row_coords := mx.array([1, 3], dtype=mx.int32),
-                          col_coords := mx.array([2, 0], dtype=mx.int32),
-                          result := arr_2d[row_coords[:, None], col_coords[None, :]],
-                          mx.eval(result),
-                          result
-                         ][4],
-                 results["workarounds"], "multi_axis")
-print_array("Multi-Axis Selection Result", result)
-
-# --- Performance and Type Tests ---
-print("\n=== Performance and Type Tests ===")
-
-# Test type promotion between different float types
-a_f32 = mx.array(1.0, dtype=mx.float32)
-b_f16 = mx.array(2.0, dtype=mx.bfloat16)
-result = run_test("Type Promotion (float32 * bfloat16)", 
-                 lambda: a_f32 * b_f16,  # Should promote to wider type (float32)
-                 results["performance"], "type_promotion")
-print_array("Result", result)
-
-# Test type preservation with Python scalar
-result = run_test("Type Preservation (bfloat16 * Python scalar)", 
-                 lambda: b_f16 * 2.0,  # Should preserve original type
-                 results["performance"], "python_scalar_mult")
-print_array("Result", result)
-
-# Benchmark mx.take vs direct indexing
-indices = mx.array([5, 10, 15, 20, 25], dtype=mx.int32)
-n_runs = 1000
-
-start = time.perf_counter()
-for _ in range(n_runs):
-    result1 = arr_1d[indices]
-direct_time = (time.perf_counter() - start) * 1000
-print(f"Direct indexing [{n_runs} runs]: {direct_time:.2f} ms")
-
-start = time.perf_counter()
-for _ in range(n_runs):
-    result2 = mx.take(arr_1d, indices)
-take_time = (time.perf_counter() - start) * 1000
-print(f"mx.take indexing [{n_runs} runs]: {take_time:.2f} ms")
-print(f"Performance ratio (take/direct): {take_time/direct_time:.2f}x")
-
-# Verify results are equivalent
-equal = mx.array_equal(result1, result2)
-print(f"Results equivalent: {equal}")
-
-# --- Lazy Evaluation Tests ---
-print("\n=== Lazy Evaluation Tests ===")
-
-# Create unevaluated expression
-a = arr_1d + 1
-result = run_test("Array Creation (Unevaluated)", 
-                 lambda: a[:5],  # Should create expression tree, not compute values
-                 results["laziness"], "unevaluated_slice")
-print_array("Result Before Evaluation", result)
-
-# Explicitly evaluate and test again
-mx.eval(a)
-result = run_test("Array After Evaluation", 
-                 lambda: a[:5],  # Should access computed values
-                 results["laziness"], "evaluated_slice")
-print_array("Result After Evaluation", result)
-
-# --- NumPy vs MLX Comparison ---
-print("\n=== NumPy vs MLX Comparison ===")
-
-# Create equivalent arrays for comparison
-np_arr = np.array(arr_1d)
-mx_arr = arr_1d
-
-# Compare memory usage
-print(f"NumPy array memory: {np_arr.nbytes} bytes")
-try:
-    print(f"MLX array memory: {mx_arr.nbytes} bytes")
-except AttributeError:
-    print("MLX arrays don't have .nbytes attribute")
-
-# Basic performance test for similar operations
-n_ops = 10000
-start = time.perf_counter()
-for _ in range(n_ops):
-    np_result = np_arr + 1.0
-np_time = (time.perf_counter() - start) * 1000
-print(f"NumPy add operation [{n_ops} runs]: {np_time:.2f} ms")
-
-start = time.perf_counter()
-for _ in range(n_ops):
-    mx_result = mx_arr + 1.0
-    # Force evaluation on the last iteration only
-    if _ == n_ops - 1:
-        mx.eval(mx_result)
-mx_time = (time.perf_counter() - start) * 1000
-print(f"MLX add operation with final eval [{n_ops} runs]: {mx_time:.2f} ms")
-print(f"Speed ratio (NumPy/MLX): {np_time/mx_time:.2f}x")
-
-# --- Compilation Performance Tests ---
-print("\n=== Compilation Performance Tests ===")
-
-# Define a simple function to compile
-def simple_func(x):
-    """Compute a series of operations on input array x."""
-    return mx.exp(x) * mx.sin(x) + mx.cos(x)
-
-# Create compiled version
-compiled_func = mx.compile(simple_func)
-
-# Create test data
-x = mx.array([0.5, 1.0, 1.5, 2.0, 2.5], dtype=mx.float32)
-runs = 1000
-
-# Benchmark uncompiled function
-start = time.perf_counter()
-for _ in range(runs):
-    result = simple_func(x)
-    if _ == runs - 1:  # Only evaluate on last run
-        mx.eval(result)
-uncompiled_time = (time.perf_counter() - start) * 1000
-
-# Benchmark first compiled run (includes compilation overhead)
-start = time.perf_counter()
-result_compiled = compiled_func(x)
-mx.eval(result_compiled)
-first_compile_time = (time.perf_counter() - start) * 1000
-
-# Benchmark subsequent compiled runs (uses cached compilation)
-start = time.perf_counter()
-for _ in range(runs - 1):
-    result_compiled = compiled_func(x)
-    if _ == runs - 2:  # Only evaluate on last run
-        mx.eval(result_compiled)
-subsequent_time = (time.perf_counter() - start) * 1000
-
-print(f"Uncompiled function [{runs} runs]: {uncompiled_time:.2f} ms")
-print(f"Compiled function - first run: {first_compile_time:.2f} ms (includes compilation)")
-print(f"Compiled function - subsequent [{runs-1} runs]: {subsequent_time:.2f} ms")
-print(f"Compilation speedup (uncompiled/subsequent): {uncompiled_time/subsequent_time:.2f}x")
-
-# --- Framework Conversion Tests ---
-print("\n=== Framework Conversion Tests ===")
-
-# MLX to NumPy conversion
-result = run_test("MLX to NumPy Conversion", 
-                 lambda: np.array(arr_1d),
-                 results["conversion"], "mlx_to_numpy")
-print(f"NumPy Array Shape: {result.shape}, Dtype: {result.dtype}")
-
-# NumPy to MLX conversion
-np_arr_small = np.array([1, 2, 3, 4, 5], dtype=np.float32)
-result = run_test("NumPy to MLX Conversion", 
-                 lambda: mx.array(np_arr_small),
-                 results["conversion"], "numpy_to_mlx")
-print_array("MLX Array", result)
-
-# MLX bfloat16 to NumPy (requires explicit casting)
-bf16_arr = mx.array([1.5, 2.5, 3.5], dtype=mx.bfloat16)
-result = run_test("MLX bfloat16 to NumPy (with casting)", 
-                 lambda: np.array(bf16_arr.astype(mx.float32)),
-                 results["conversion"], "bf16_to_numpy")
-print(f"NumPy Array from bfloat16: {result}")
-
-# Test PyTorch conversion tests (if available)
-if TORCH_AVAILABLE:
-    # MLX to PyTorch via memoryview
-    result = run_test("MLX to PyTorch Conversion (via memoryview)", 
-                    lambda: torch.tensor(memoryview(arr_1d[:10])),
-                    results["conversion"], "mlx_to_torch_memoryview")
-    print(f"PyTorch Array (via memoryview): {result}")
-    
-    # MLX to PyTorch via NumPy intermediate
-    result = run_test("MLX to PyTorch Conversion (via NumPy)", 
-                    lambda: torch.from_numpy(np.array(arr_1d[:10])),
-                    results["conversion"], "mlx_to_torch_numpy")
-    print(f"PyTorch Array (via NumPy): {result}")
-    
-    # Test convolution weight format conversion (MLX to PyTorch)
-    # MLX: [out_channels, kernel_size, in_channels]
-    # PyTorch: [out_channels, in_channels, kernel_size]
-    mlx_conv_weights = mx.ones((16, 3, 8), dtype=mx.float32)
-    result = run_test("MLX 1D Conv Weight to PyTorch Format", 
-                    lambda: torch.from_numpy(np.array(mlx_conv_weights)).permute(0, 2, 1),
-                    results["conversion"], "mlx_conv_to_torch")
-    print(f"PyTorch Conv Weights Shape: {list(result.shape)}")
-    
-    # Test 2D convolution weight format conversion
-    # MLX: [out_channels, kernel_height, kernel_width, in_channels]
-    # PyTorch: [out_channels, in_channels, kernel_height, kernel_width]
-    mlx_conv2d_weights = mx.ones((16, 3, 3, 8), dtype=mx.float32)
-    result = run_test("MLX 2D Conv Weight to PyTorch Format", 
-                    lambda: torch.from_numpy(np.array(mlx_conv2d_weights)).permute(0, 3, 1, 2),
-                    results["conversion"], "mlx_conv2d_to_torch")
-    print(f"PyTorch Conv2D Weights Shape: {list(result.shape)}")
-else:
-    print("PyTorch not available for conversion tests")
-
-#------------------------------------------------------------------------------
-# Buffer Pre-allocation Tests
-#------------------------------------------------------------------------------
-print("\n=== Buffer Pre-allocation Tests ===")
-
-# Test index buffer pre-allocation with dynamic resizing
-max_size = 10
-buffer_index = mx.zeros((max_size,), dtype=mx.int32)
-print_array("Initial Index Buffer", buffer_index)
-
-# Test with different sizes
-sizes_to_test = [3, 5, 8, 10]
-for n in sizes_to_test:
-    result = run_test(f"Dynamic Buffer Resize (n={n})", 
-                     lambda: [buffer_index[:n].__setitem__(slice(None), mx.arange(n, dtype=mx.int32)), 
-                             arr_1d[buffer_index[:n]]][1],
-                     results["buffer_prealloc"], f"resize_{n}")
-    print_array(f"Result with n={n}", result)
-
-# Test exceeding buffer capacity
-n_exceed = max_size + 2
-result = run_test(f"Exceed Buffer Capacity (n={n_exceed})", 
-                 lambda: [buffer_index[:n_exceed].__setitem__(slice(None), mx.arange(n_exceed, dtype=mx.int32)), 
-                         arr_1d[buffer_index[:n_exceed]]][1],
-                 results["buffer_prealloc"], "exceed_capacity")
-print_array("Result when Exceeding Capacity", result)
-
-#------------------------------------------------------------------------------
-# Compiled Indexing Tests
-#------------------------------------------------------------------------------
-print("\n=== Compiled Indexing Tests ===")
-
-# Define a function that performs indexing operations
-def index_function(arr, indices):
-    """Perform multiple indexing and arithmetic operations on array elements."""
-    # Chain multiple operations to make the compilation difference more visible
-    result = arr[indices]
-    result = result + 1.0
-    result = result * 2.0
+        result = fn()
+    except Exception as exc:  # pragma: no cover - defensive harness code
+        return Result("FAIL", name, f"{type(exc).__name__}: {exc}")
+    result.name = name
     return result
 
-# Create a compiled version for performance comparison
-compiled_index_function = mx.compile(index_function)
 
-# Create test data for indexing benchmarks
-test_arr = mx.arange(10000, dtype=mx.float32)
-test_indices = mx.array([i for i in range(0, 5000, 10)], dtype=mx.int32)  # 500 indices
-print_array("Test Array Sample", test_arr[:5])
-print_array("Test Indices Sample", test_indices[:5])
+def check_mlx_version() -> Result:
+    state = compare_version(mx.__version__, BASELINE_MLX)
+    if state == "equal":
+        return Result("PASS", "", f"mlx=={mx.__version__}")
+    if state == "newer":
+        return Result(
+            "WARN",
+            "",
+            f"mlx=={mx.__version__}; repo baseline is {BASELINE_MLX}",
+        )
+    return Result(
+        "FAIL",
+        "",
+        f"mlx=={mx.__version__}; repo baseline requires at least {BASELINE_MLX}",
+    )
 
-# Warmup (compile the function)
-warmup = run_test("Compiled Indexing Warmup", 
-                 lambda: [result := compiled_index_function(test_arr, test_indices), mx.eval(result)][0],
-                 results["compiled_index"], "warmup")
 
-# Benchmark uncompiled function
-runs = 100
-start = time.perf_counter()
-for _ in range(runs):
-    result_uncompiled = index_function(test_arr, test_indices)
-    if _ == runs - 1:  # Only evaluate on last run
-        mx.eval(result_uncompiled)
-uncompiled_time = (time.perf_counter() - start) * 1000
-print(f"Uncompiled indexing function [{runs} runs]: {uncompiled_time:.2f} ms")
+def check_default_dtypes() -> Result:
+    ints = mx.array([1, 2])
+    floats = mx.array([1.0, 2.0])
+    if ints.dtype != mx.int32 or floats.dtype != mx.float32:
+        return Result(
+            "FAIL",
+            "",
+            f"got int dtype {ints.dtype} and float dtype {floats.dtype}",
+        )
+    return Result("PASS", "", "integer literals -> int32, float literals -> float32")
 
-# Benchmark compiled function
-start = time.perf_counter()
-for _ in range(runs):
-    result_compiled = compiled_index_function(test_arr, test_indices)
-    if _ == runs - 1:  # Only evaluate on last run
-        mx.eval(result_compiled)
-compiled_time = (time.perf_counter() - start) * 1000
-print(f"Compiled indexing function [{runs} runs]: {compiled_time:.2f} ms")
 
-# Calculate speedup from compilation
-speedup = uncompiled_time / compiled_time if compiled_time > 0 else 0
-print(f"Indexing compilation speedup: {speedup:.2f}x")
+def check_boolean_selection_and_assignment() -> Result:
+    arr = mx.array([1.0, 2.0, 3.0])
+    mask = mx.array([True, False, True])
+    try:
+        _ = arr[mask]
+    except ValueError as exc:
+        if "boolean indices" not in str(exc):
+            return Result("FAIL", "", f"unexpected boolean selection error: {exc}")
+    else:
+        return Result("FAIL", "", "boolean selection unexpectedly succeeded")
 
-# Verify compiled and uncompiled results match
-result_match = run_test("Check Compiled vs Uncompiled Results Match", 
-                       lambda: [mx.eval(result_uncompiled), 
-                                mx.eval(result_compiled),
-                                mx.array_equal(result_uncompiled, result_compiled)][2],
-                       results["compiled_index"], "result_match")
-print(f"Results match: {result_match}")
+    arr[mask] = mx.array([5.0, 6.0])
+    if not arrays_equal(arr, mx.array([5.0, 2.0, 6.0])):
+        return Result("FAIL", "", f"boolean assignment result was {arr}")
+    return Result("PASS", "", "selection unsupported, assignment supported")
 
-#------------------------------------------------------------------------------
-# Results Summary
-#------------------------------------------------------------------------------
-print("\n=== Summary of Behaviors ===")
 
-print("1. Array Indexing:")
-direct_fails = all(not r["success"] for k, r in results["indexing"].items() if "direct" in k)
-print(f"  - Direct mask indexing {'unsupported' if direct_fails else 'partially supported'} across dimensions.")
-slice_issues = any("placeholder_slice_filtered" in k and r["success"] and r["result"].size != mx.sum(masks_1d.get(mask_name, mx.zeros(0))).item() 
-                   for mask_name in masks_1d for k, r in results["indexing"].items() if mask_name.lower().replace(' ', '_') in k)
-print(f"  - Placeholder-based indexing with slicing {'inconsistent' if slice_issues else 'consistent'}; {'may alter element count' if slice_issues else 'preserves count'}.")
-single_where_fails = all(not r["success"] for k, r in results["indexing"].items() if "single_where" in k)
-print(f"  - Single-argument mx.where {'invalid' if single_where_fails else 'valid'}; {'requires 3 arguments' if single_where_fails else 'works as expected'}.")
-three_where_works = all(r["success"] for k, r in results["indexing"].items() if "valid_filtered" in k and "empty" not in k)
-print(f"  - Three-argument mx.where {'effective' if three_where_works else 'ineffective'} with valid index extraction.")
-nonzero_fails = all(not r["success"] for k, r in results["indexing"].items() if "nonzero" in k)
-print(f"  - Nonzero function {'unavailable' if nonzero_fails else 'available'}.")
-two_d_flat_works = all(r["success"] for k, r in results["indexing"].items() if "2d" in k and "valid_filtered_flat" in k)
-print(f"  - 2D indexing {'requires flattening' if two_d_flat_works else 'supports direct methods'} for workaround.")
+def check_where_nonzero_argwhere_absence() -> Result:
+    mask = mx.array([True, False, True])
+    try:
+        _ = mx.where(mask)
+    except TypeError:
+        pass
+    else:
+        return Result("FAIL", "", "single-argument mx.where unexpectedly succeeded")
 
-print("2. Slice Assignment:")
-normal_works = results["assignment"]["normal_length"]["success"]
-print(f"  - Normal-length assignments {'modify buffer correctly' if normal_works else 'fail to modify buffer'}.")
-over_fails = not results["assignment"]["over_length"]["success"]
-print(f"  - Over-length assignments {'fail with shape mismatch' if over_fails else 'succeed unexpectedly'}.")
-dynamic_works = results["assignment"]["dynamic_concat"]["success"]
-print(f"  - Concatenation {'reliable' if dynamic_works else 'unreliable'} for dynamic lengths.")
-float_casts = results["assignment"]["float_indices_assign"]["success"]
-print(f"  - Float indices in assignments {'cast silently to integer' if float_casts else 'rejected or fail'}.")
-empty_noop = results["assignment"]["empty_indices"]["success"] and buffer[0] == results["assignment"]["empty_indices"]["result"][0]
-print(f"  - Empty assignments {'leave buffer unchanged' if empty_noop else 'modify buffer'}.")
-beyond_ignored = results["assignment"]["beyond_bounds"]["success"] and buffer[0] == results["assignment"]["beyond_bounds"]["result"][0]
-print(f"  - Beyond-bounds assignments {'silently ignored' if beyond_ignored else 'processed or error'}.")
-at_works = results["assignment"]["at_add_duplicate"]["success"] and results["assignment"]["at_multiply_duplicate"]["success"]
-print(f"  - .at API operations {'supported' if at_works else 'unsupported'} for correct handling of duplicate indices.")
-standard_dup_works = results["assignment"]["standard_duplicate"]["success"]
-at_dup_diff = False
-if standard_dup_works and at_works:
-    # Check if .at.add() behaves differently than standard assignment for duplicates
-    std_result = results["assignment"]["standard_duplicate"]["result"]
-    at_result = results["assignment"]["at_add_duplicate"]["result"]
-    at_dup_diff = not mx.array_equal(std_result, at_result) and at_result[0] > std_result[0]
-print(f"  - Duplicate index handling {'differs between standard and .at API' if at_dup_diff else 'behaves identically'}; " + 
-      f"{'standard assignment keeps only last update [1,0,1,0,1], while .at applies all updates [2,0,2,0,1]' if at_dup_diff else 'both APIs handle duplicates the same way'}.")
-ref_match = results["assignment"]["reference_modify"]["success"] and mx.array_equal(results["assignment"]["reference_modify"]["result"][0], results["assignment"]["reference_modify"]["result"][1])
-print(f"  - Modifications {'affect all references' if ref_match else 'create new copies'}.")
+    missing = [name for name in ("nonzero", "argwhere") if hasattr(mx, name)]
+    if missing:
+        return Result("FAIL", "", f"unexpected helpers present: {', '.join(missing)}")
+    return Result("PASS", "", "single-argument where/nonzero/argwhere absent")
 
-print("3. Edge Cases:")
-beyond_scalar = results["edge_cases"]["beyond_bounds"]["success"] and results["edge_cases"]["beyond_bounds"]["result"].shape == ()
-print(f"  - Beyond-bounds indexing {'returns scalar silently' if beyond_scalar else 'errors or behaves differently'}.")
-float_reject = not results["edge_cases"]["float_indices"]["success"]
-print(f"  - Float indices in indexing {'rejected as non-integral' if float_reject else 'accepted unexpectedly'}.")
-lazy_same = results["edge_cases"]["lazy_unevaluated"]["success"] and results["edge_cases"]["lazy_evaluated"]["success"] and mx.array_equal(results["edge_cases"]["lazy_unevaluated"]["result"], results["edge_cases"]["lazy_evaluated"]["result"])
-print(f"  - Lazy evaluation {'does not alter indexing results' if lazy_same else 'affects indexing results'}.")
-dynamic_slice_fails = not results["edge_cases"]["dynamic_slice_python_var"]["success"]
-print(f"  - Dynamic slicing with Python variables {'fails with ValueError' if dynamic_slice_fails else 'supported in MLX 0.23.2'}.")
-multi_bounds = results["edge_cases"]["multi_beyond_bounds"]["success"]
-multi_array = multi_bounds and results["edge_cases"]["multi_beyond_bounds"]["result"].ndim > 0
-print(f"  - Multi-index beyond bounds {'returns array' if multi_array else 'returns scalar or fails'} when accessing invalid indices.")
 
-print("4. NumPy-like Behavior:")
-slice_flat = results["edge_cases"]["2d_slice_flatten"]["success"]
-print(f"  - 2D slice flattening {'requires explicit flatten' if slice_flat else 'behaves like NumPy'} (NumPy flattens directly).")
-scalar_extract = results["edge_cases"]["scalar_extract"]["success"]
-print(f"  - Scalar extraction from slice {'works like NumPy' if scalar_extract else 'differs from NumPy'}.")
+def check_helper_creation_apis() -> Result:
+    arr = mx.arange(4)
+    try:
+        _ = mx.ones_like(arr, dtype=mx.int32)
+    except TypeError:
+        pass
+    else:
+        return Result("FAIL", "", "ones_like unexpectedly accepted dtype=")
 
-print("5. Boolean Indexing Workarounds:")
-where_works = results["workarounds"]["where_sum_based"]["success"]
-print(f"  - Boolean mask conversion with sum-based slicing {'supported' if where_works else 'unsupported'}.")
-placeholder_works = results["workarounds"]["where_placeholder"]["success"]
-placeholder_reliable = placeholder_works and results["workarounds"]["filtered_where_placeholder"]["success"] and \
-                      results["workarounds"]["filtered_where_placeholder"]["result"].size == mx.sum(mask_pos).item()
-print(f"  - Boolean mask conversion with placeholder {'reliable' if placeholder_reliable else 'unreliable or unsupported'}.")
-argsort_works = results["workarounds"]["argsort_top_n"]["success"]
-print(f"  - Top-n extraction via argsort {'supported' if argsort_works else 'unsupported'}.")
-multi_axis_works = results["workarounds"]["multi_axis"]["success"]
-print(f"  - Multi-axis coordinate indexing {'supported' if multi_axis_works else 'unsupported'}.")
+    try:
+        _ = mx.zeros_like(arr, dtype=mx.int32)
+    except TypeError:
+        pass
+    else:
+        return Result("FAIL", "", "zeros_like unexpectedly accepted dtype=")
 
-print("6. Performance:")
-type_promotion_works = results["performance"]["type_promotion"]["success"]
-print(f"  - Type promotion {'supported' if type_promotion_works else 'unsupported'}.")
-python_scalar_mult_works = results["performance"]["python_scalar_mult"]["success"]
-print(f"  - Type preservation with Python scalar {'supported' if python_scalar_mult_works else 'unsupported'}.")
+    if hasattr(mx, "full_like"):
+        return Result("FAIL", "", "mx.full_like unexpectedly exists")
 
-print("7. Laziness:")
-unevaluated_slice_works = results["laziness"]["unevaluated_slice"]["success"]
-print(f"  - Array creation (unevaluated slice) {'supported' if unevaluated_slice_works else 'unsupported'}.")
-evaluated_slice_works = results["laziness"]["evaluated_slice"]["success"]
-print(f"  - Array evaluation (evaluated slice) {'supported' if evaluated_slice_works else 'unsupported'}.")
+    if arr.nbytes != arr.size * arr.itemsize:
+        return Result(
+            "FAIL",
+            "",
+            f"nbytes mismatch: nbytes={arr.nbytes}, size={arr.size}, itemsize={arr.itemsize}",
+        )
+    return Result("PASS", "", "nbytes exists; ones_like dtype/full_like match baseline")
 
-print("8. Framework Conversion:")
-to_numpy_works = results["conversion"]["mlx_to_numpy"]["success"]
-print(f"  - MLX to NumPy conversion {'supported' if to_numpy_works else 'unsupported'}.")
-from_numpy_works = results["conversion"]["numpy_to_mlx"]["success"]
-print(f"  - NumPy to MLX conversion {'supported' if from_numpy_works else 'unsupported'}.")
-bf16_to_numpy_works = results["conversion"]["bf16_to_numpy"]["success"]
-print(f"  - BFloat16 conversion {'requires explicit casting' if bf16_to_numpy_works else 'automatic'}.")
-if TORCH_AVAILABLE:
-    torch_memview_works = results["conversion"]["mlx_to_torch_memoryview"]["success"]
-    print(f"  - MLX to PyTorch via memoryview {'supported' if torch_memview_works else 'unsupported'}.")
-    conv_perm_works = results["conversion"]["mlx_conv_to_torch"]["success"]
-    print(f"  - Conv weight permutation {'required' if conv_perm_works else 'not required'} for PyTorch compatibility.")
 
-print("9. Buffer Pre-allocation:")
-buffer_resize_works = all(results["buffer_prealloc"][f"resize_{n}"]["success"] for n in [3, 5, 8, 10])
-print(f"  - Dynamic buffer resizing {'supported' if buffer_resize_works else 'unsupported'} for varying sizes.")
-exceed_fails = not results["buffer_prealloc"]["exceed_capacity"]["success"]
-print(f"  - Exceeding pre-allocated buffer capacity {'fails as expected' if exceed_fails else 'succeeds unexpectedly'}.")
+def check_indexing_surface() -> Result:
+    arr = mx.arange(12, dtype=mx.int32).reshape(3, 4)
 
-print("10. Compiled Indexing:")
-compiled_works = results["compiled_index"]["warmup"]["success"]
-result_matches = results["compiled_index"]["result_match"]["success"] and results["compiled_index"]["result_match"]["result"]
-print(f"  - Compiled indexing functions {'supported' if compiled_works else 'unsupported'}.")
-print(f"  - Compiled and uncompiled results {'match' if result_matches else 'differ'}.")
-if compiled_works:
-    print(f"  - Compilation provides {speedup:.2f}x speedup for indexing operations.")
+    if arr[-1, -1].item() != 11:
+        return Result("FAIL", "", f"negative indexing returned {arr[-1, -1]}")
+
+    expanded = arr[None, ..., 1:3]
+    if expanded.shape != (1, 3, 2):
+        return Result("FAIL", "", f"unexpected None/ellipsis shape {expanded.shape}")
+
+    take = mx.take(arr, mx.array([2, 0], dtype=mx.int32), axis=0)
+    if take.shape != (2, 4) or take[0, 0].item() != 8 or take[1, 0].item() != 0:
+        return Result("FAIL", "", f"unexpected take() result {take}")
+
+    gather_idx = mx.array([[0, 2], [1, 0], [3, 1]], dtype=mx.int32)
+    gathered = mx.take_along_axis(arr, gather_idx, axis=1)
+    expected = mx.array([[0, 2], [5, 4], [11, 9]], dtype=mx.int32)
+    if not arrays_equal(gathered, expected):
+        return Result("FAIL", "", f"unexpected take_along_axis() result {gathered}")
+
+    return Result("PASS", "", "negative indices, None/ellipsis, take(), and take_along_axis() work")
+
+
+def check_slice_copy_and_aliasing() -> Result:
+    alias_source = mx.array([1, 2, 3])
+    alias = alias_source
+    alias[2] = 0
+    if not arrays_equal(alias_source, mx.array([1, 2, 0])):
+        return Result("FAIL", "", "alias update did not affect original array")
+
+    sliced_source = mx.array([1, 2, 3])
+    sliced = sliced_source[:]
+    sliced[2] = 0
+    if not arrays_equal(sliced_source, mx.array([1, 2, 3])):
+        return Result("FAIL", "", "slice unexpectedly mutated original array")
+    return Result("PASS", "", "aliases share storage; slices are copies")
+
+
+def check_duplicate_updates() -> Result:
+    idx = mx.array([0, 2, 0, 2, 4], dtype=mx.int32)
+    standard = mx.zeros((5,), dtype=mx.int32)
+    standard[idx] = mx.ones_like(idx)
+
+    accumulated = mx.zeros((5,), dtype=mx.int32)
+    accumulated = accumulated.at[idx].add(1)
+    mx.eval(accumulated)
+
+    if not arrays_equal(standard, mx.array([1, 0, 1, 0, 1], dtype=mx.int32)):
+        return Result("FAIL", "", f"unexpected direct duplicate-write result: {standard}")
+    if not arrays_equal(accumulated, mx.array([2, 0, 2, 0, 1], dtype=mx.int32)):
+        return Result("FAIL", "", f"unexpected .at.add result: {accumulated}")
+    return Result("PASS", "", "direct duplicate writes differ from .at accumulations")
+
+
+def check_index_dtype_and_dynamic_slice() -> Result:
+    arr = mx.arange(10, dtype=mx.float32) - 5
+    picked = arr[mx.array([6, 7, 8, 9], dtype=mx.int32)]
+    if not arrays_equal(picked, mx.array([1.0, 2.0, 3.0, 4.0], dtype=mx.float32)):
+        return Result("FAIL", "", f"unexpected integral indexing result: {picked}")
+
+    try:
+        _ = mx.take(arr, mx.array([0.5, 1.5]))
+    except ValueError:
+        pass
+    else:
+        return Result("FAIL", "", "mx.take unexpectedly accepted float indices")
+
+    if not arrays_equal(arr[:5], mx.array([-5, -4, -3, -2, -1], dtype=mx.float32)):
+        return Result("FAIL", "", "dynamic Python slicing returned the wrong values")
+    return Result("PASS", "", "integral indexing and dynamic slicing behave as expected")
+
+
+def check_compile_and_shapeless() -> Result:
+    compiled = mx.compile(lambda x: x + 1)
+    shapeless = mx.compile(lambda x: x + 1, shapeless=True)
+
+    one = compiled(mx.array([1.0], dtype=mx.float32))
+    two = shapeless(mx.array([1.0, 2.0], dtype=mx.float32))
+    three = shapeless(mx.array([1.0, 2.0, 3.0], dtype=mx.float32))
+    mx.eval(one, two, three)
+
+    if one.shape != (1,) or two.shape != (2,) or three.shape != (3,):
+        return Result(
+            "FAIL",
+            "",
+            f"unexpected compiled shapes: {one.shape}, {two.shape}, {three.shape}",
+        )
+    return Result("PASS", "", "compile() and shapeless compile() both work")
+
+
+def check_compile_and_fast_surface() -> Result:
+    compile_doc = (mx.compile.__doc__ or "").splitlines()[0]
+    if "shapeless" not in compile_doc:
+        return Result("FAIL", "", f"unexpected compile doc signature: {compile_doc!r}")
+    if not hasattr(mx, "disable_compile"):
+        return Result("FAIL", "", "mx.disable_compile is missing")
+    if not hasattr(mx.fast, "scaled_dot_product_attention"):
+        return Result("FAIL", "", "mx.fast.scaled_dot_product_attention is missing")
+    if not hasattr(mx.fast, "rms_norm"):
+        return Result("FAIL", "", "mx.fast.rms_norm is missing")
+    return Result("PASS", "", "compile debug hooks and mx.fast kernels are present")
+
+
+def check_compile_recompilation_rules() -> Result:
+    retrace_counter = {"n": 0}
+
+    def traced(x):
+        retrace_counter["n"] += 1
+        return x + 1
+
+    compiled = mx.compile(traced)
+    mx.eval(compiled(mx.array([1.0], dtype=mx.float32)))
+    mx.eval(compiled(mx.array([2.0], dtype=mx.float32)))
+    mx.eval(compiled(mx.array([[1.0]], dtype=mx.float32)))
+    mx.eval(compiled(mx.array([1], dtype=mx.int32)))
+
+    if retrace_counter["n"] != 3:
+        return Result(
+            "FAIL",
+            "",
+            f"expected 3 traces for same/rank/dtype changes, got {retrace_counter['n']}",
+        )
+
+    shapeless_counter = {"n": 0}
+
+    def shapeless_traced(x):
+        shapeless_counter["n"] += 1
+        return x + 1
+
+    shapeless_compiled = mx.compile(shapeless_traced, shapeless=True)
+    mx.eval(shapeless_compiled(mx.array([1.0], dtype=mx.float32)))
+    mx.eval(shapeless_compiled(mx.array([1.0, 2.0], dtype=mx.float32)))
+    if shapeless_counter["n"] != 1:
+        return Result(
+            "FAIL",
+            "",
+            f"shapeless compile retraced on shape-only change: {shapeless_counter['n']}",
+        )
+
+    arity_counter = {"n": 0}
+
+    def variadic(*xs):
+        arity_counter["n"] += 1
+        out = xs[0]
+        for x in xs[1:]:
+            out = out + x
+        return out
+
+    arity_compiled = mx.compile(variadic)
+    mx.eval(arity_compiled(mx.array([1.0], dtype=mx.float32)))
+    mx.eval(arity_compiled(mx.array([2.0], dtype=mx.float32)))
+    mx.eval(
+        arity_compiled(
+            mx.array([1.0], dtype=mx.float32),
+            mx.array([2.0], dtype=mx.float32),
+        )
+    )
+    mx.eval(
+        arity_compiled(
+            mx.array([3.0], dtype=mx.float32),
+            mx.array([4.0], dtype=mx.float32),
+        )
+    )
+    if arity_counter["n"] != 2:
+        return Result(
+            "FAIL",
+            "",
+            f"expected arity change to retrace once, got {arity_counter['n']}",
+        )
+
+    return Result(
+        "PASS",
+        "",
+        "compile retraces on rank/dtype/arity changes, while shapeless avoids shape-only retraces",
+    )
+
+
+def check_numpy_interop() -> Result:
+    arr = mx.arange(3)
+    view = np.array(arr, copy=False)
+    view[0] = 7
+    if arr[0].item() != 7:
+        return Result("FAIL", "", "NumPy copy=False did not reflect back into MLX")
+
+    bf16 = mx.array([1.5, 2.5], dtype=mx.bfloat16)
+    try:
+        _ = np.array(bf16)
+    except RuntimeError:
+        pass
+    else:
+        return Result("FAIL", "", "bfloat16 unexpectedly converted to NumPy without cast")
+
+    casted = np.array(bf16.astype(mx.float32))
+    if casted.dtype != np.float32 or casted.tolist() != [1.5, 2.5]:
+        return Result("FAIL", "", f"unexpected casted bfloat16 conversion: {casted}")
+
+    np64 = np.array([1.0, 2.0], dtype=np.float64)
+    if mx.array(np64).dtype != mx.float32:
+        return Result("FAIL", "", "NumPy float64 no longer defaults to MLX float32")
+    return Result("PASS", "", "NumPy view and dtype-conversion caveats match baseline")
+
+
+def check_random_contract() -> Result:
+    key_a = mx.random.key(0)
+    key_b = mx.random.key(0)
+    if not arrays_equal(key_a, key_b):
+        return Result("FAIL", "", "mx.random.key(0) was not reproducible")
+
+    mx.random.seed(42)
+    first = mx.random.uniform(shape=(3,))
+    mx.random.seed(42)
+    second = mx.random.uniform(shape=(3,))
+    if not arrays_equal(first, second):
+        return Result("FAIL", "", "mx.random.seed(...) was not reproducible")
+    return Result("PASS", "", "global seed and explicit keys are reproducible")
+
+
+def check_oob_observation() -> Result:
+    arr = mx.arange(10, dtype=mx.float32) - 5
+    single = arr[10]
+    multi = arr[mx.array([10, 11], dtype=mx.int32)]
+    return Result(
+        "WARN",
+        "",
+        f"observed OOB result single={single}, multi={multi}; upstream docs still call this undefined behavior",
+    )
+
+
+def check_at_surface_and_weight_layouts() -> Result:
+    arr = mx.array([1, 2, 3])
+    updater = arr.at[mx.array([0], dtype=mx.int32)]
+    methods = sorted(name for name in dir(updater) if not name.startswith("_"))
+    expected_methods = ["add", "divide", "maximum", "minimum", "multiply", "subtract"]
+    if methods != expected_methods:
+        return Result("FAIL", "", f"unexpected .at methods: {methods}")
+
+    linear = nn.Linear(3, 4)
+    conv1d = nn.Conv1d(6, 8, 3, groups=2)
+    conv2d = nn.Conv2d(6, 8, (3, 5), groups=2)
+    if linear.weight.shape != (4, 3):
+        return Result("FAIL", "", f"unexpected Linear weight shape {linear.weight.shape}")
+    if conv1d.weight.shape != (8, 3, 3):
+        return Result("FAIL", "", f"unexpected Conv1d weight shape {conv1d.weight.shape}")
+    if conv2d.weight.shape != (8, 3, 5, 3):
+        return Result("FAIL", "", f"unexpected Conv2d weight shape {conv2d.weight.shape}")
+    return Result("PASS", "", ".at surface and MLX linear/conv weight layouts match baseline")
+
+
+def check_training_surface_and_optimizer_flow() -> Result:
+    import mlx.optimizers as optim
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(2, 1, bias=False)
+
+        def __call__(self, x):
+            return self.lin(x)
+
+    model = Tiny()
+    optimizer = optim.SGD(learning_rate=0.1)
+    mx.eval(model.parameters())
+
+    if hasattr(mx.array([1.0]), "backward"):
+        return Result("FAIL", "", "mx.array unexpectedly exposes backward()")
+    if callable(getattr(optimizer, "step", None)):
+        return Result("FAIL", "", "optimizer.step unexpectedly became a method")
+    if not callable(getattr(optimizer, "update", None)):
+        return Result("FAIL", "", "optimizer.update is missing or not callable")
+
+    def loss_fn(m, x, y):
+        return ((m(x) - y) ** 2).mean()
+
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
+    loss, grads = loss_and_grad(
+        model,
+        mx.array([[1.0, 2.0]], dtype=mx.float32),
+        mx.array([[1.0]], dtype=mx.float32),
+    )
+    if loss.shape != ():
+        return Result("FAIL", "", f"unexpected scalar loss shape {loss.shape}")
+    if "lin" not in grads or "weight" not in grads["lin"]:
+        return Result("FAIL", "", f"unexpected gradient tree {grads.keys()}")
+
+    old_step = optimizer.step.item()
+    old_weight = mx.array(model.lin.weight)
+    optimizer.update(model, grads)
+    mx.eval(model.parameters(), optimizer.state)
+    if optimizer.step.item() != old_step + 1:
+        return Result(
+            "FAIL",
+            "",
+            f"optimizer step counter did not advance: {old_step} -> {optimizer.step.item()}",
+        )
+    if arrays_equal(old_weight, model.lin.weight):
+        return Result("FAIL", "", "optimizer.update did not change model weights")
+    return Result(
+        "PASS",
+        "",
+        "training uses nn.value_and_grad + optimizer.update; optimizer.step is state, and eval(model.parameters(), optimizer.state) materializes the update",
+    )
+
+
+def check_channels_last_surface() -> Result:
+    conv1d = nn.Conv1d(6, 8, 3)
+    conv2d = nn.Conv2d(6, 8, (3, 5))
+    conv3d = nn.Conv3d(3, 4, 2)
+
+    y1 = conv1d(mx.ones((2, 5, 6), dtype=mx.float32))
+    y2 = conv2d(mx.ones((2, 7, 9, 6), dtype=mx.float32))
+    y3 = conv3d(mx.ones((2, 4, 5, 6, 3), dtype=mx.float32))
+    mx.eval(y1, y2, y3)
+
+    if y1.shape != (2, 3, 8):
+        return Result("FAIL", "", f"unexpected Conv1d output shape {y1.shape}")
+    if y2.shape != (2, 5, 5, 8):
+        return Result("FAIL", "", f"unexpected Conv2d output shape {y2.shape}")
+    if y3.shape != (2, 3, 4, 5, 4):
+        return Result("FAIL", "", f"unexpected Conv3d output shape {y3.shape}")
+    return Result(
+        "PASS",
+        "",
+        "MLX convolution inputs are channels-last: NLC, NHWC, and NDHWC",
+    )
+
+
+def check_stream_surface() -> Result:
+    for name in ("default_stream", "new_stream", "stream", "synchronize"):
+        if not hasattr(mx, name):
+            return Result("FAIL", "", f"mx.{name} is missing")
+
+    stream = mx.new_stream(mx.default_device())
+    if stream == mx.default_stream(mx.default_device()):
+        return Result("FAIL", "", "mx.new_stream returned the default stream")
+
+    out = mx.add(mx.array([1.0]), mx.array([2.0]), stream=stream)
+    mx.synchronize(stream)
+    if out.item() != 3.0:
+        return Result("FAIL", "", f"unexpected stream result {out}")
+    return Result(
+        "PASS",
+        "",
+        "stream= works on core ops, new_stream() creates a non-default stream, and synchronize() is available",
+    )
+
+
+def check_metal_kernel_surface() -> Result:
+    if not hasattr(mx, "custom_function"):
+        return Result("FAIL", "", "mx.custom_function is missing")
+    if not hasattr(mx, "metal"):
+        return Result("FAIL", "", "mx.metal is missing")
+    for name in ("is_available", "start_capture", "stop_capture"):
+        if not hasattr(mx.metal, name):
+            return Result("FAIL", "", f"mx.metal.{name} is missing")
+    if not hasattr(mx.fast, "metal_kernel"):
+        return Result("FAIL", "", "mx.fast.metal_kernel is missing")
+    if not mx.metal.is_available():
+        return Result(
+            "WARN",
+            "",
+            "Metal backend unavailable, so only metal-kernel and capture hook surface was checked",
+        )
+
+    source = """
+        uint elem = thread_position_in_grid.x;
+        uint loc = elem_to_loc(elem, inp_shape, inp_strides, inp_ndim);
+        out[elem] = metal::exp(inp[loc]);
+    """
+    kernel = mx.fast.metal_kernel(
+        name="validation_exp_strided",
+        input_names=["inp"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=False,
+    )
+    arr = (mx.arange(8, dtype=mx.float32).reshape(4, 2) - 3)[::2]
+    out = kernel(
+        inputs=[arr],
+        template=[("T", mx.float32)],
+        grid=(arr.size, 1, 1),
+        threadgroup=(arr.size, 1, 1),
+        output_shapes=[arr.shape],
+        output_dtypes=[arr.dtype],
+    )[0]
+    mx.eval(out)
+    if not bool(mx.allclose(out, mx.exp(arr)).item()):
+        return Result("FAIL", "", f"unexpected metal kernel result {out}")
+    return Result(
+        "PASS",
+        "",
+        "mx.fast.metal_kernel works on a strided-input exp kernel; custom_function and metal capture hooks are present",
+    )
+
+
+def load_mlx_lm():
+    try:
+        import mlx_lm
+        from mlx_lm import batch_generate, convert, generate, load, stream_generate
+        from mlx_lm.generate import GenerationResponse
+        from mlx_lm.models.base import create_attention_mask
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            ConcatenateKVCache,
+            KVCache,
+            QuantizedKVCache,
+            RotatingKVCache,
+            can_trim_prompt_cache,
+            load_prompt_cache,
+            make_prompt_cache,
+            save_prompt_cache,
+            trim_prompt_cache,
+        )
+        from mlx_lm.utils import _transform_awq_weights
+    except ImportError as exc:
+        return exc, None
+
+    exports = {
+        "_transform_awq_weights": _transform_awq_weights,
+        "ArraysCache": ArraysCache,
+        "ConcatenateKVCache": ConcatenateKVCache,
+        "GenerationResponse": GenerationResponse,
+        "module": mlx_lm,
+        "batch_generate": batch_generate,
+        "can_trim_prompt_cache": can_trim_prompt_cache,
+        "convert": convert,
+        "trim_prompt_cache": trim_prompt_cache,
+        "generate": generate,
+        "load": load,
+        "stream_generate": stream_generate,
+        "create_attention_mask": create_attention_mask,
+        "KVCache": KVCache,
+        "QuantizedKVCache": QuantizedKVCache,
+        "RotatingKVCache": RotatingKVCache,
+        "load_prompt_cache": load_prompt_cache,
+        "make_prompt_cache": make_prompt_cache,
+        "save_prompt_cache": save_prompt_cache,
+    }
+    return None, exports
+
+
+MLX_LM_IMPORT_ERROR, MLX_LM = load_mlx_lm()
+
+
+def require_mlx_lm() -> Result:
+    if MLX_LM_IMPORT_ERROR is not None:
+        return Result("FAIL", "", f"mlx_lm import failed: {MLX_LM_IMPORT_ERROR}")
+    version = MLX_LM["module"].__version__
+    state = compare_version(version, BASELINE_MLX_LM)
+    if state == "equal":
+        return Result(
+            "WARN",
+            "",
+            "mlx_lm==0.31.0 loaded; note the PyPI 0.31.0 wheel was yanked, so prefer the GitHub tag or a newer non-yanked release",
+        )
+    if state == "newer":
+        return Result(
+            "WARN",
+            "",
+            f"mlx_lm=={version}; repo baseline is {BASELINE_MLX_LM}",
+        )
+    return Result(
+        "FAIL",
+        "",
+        f"mlx_lm=={version}; repo baseline requires at least {BASELINE_MLX_LM}",
+    )
+
+
+def check_mlx_lm_exports_and_signature() -> Result:
+    exports = (
+        MLX_LM["load"],
+        MLX_LM["convert"],
+        MLX_LM["generate"],
+        MLX_LM["stream_generate"],
+        MLX_LM["batch_generate"],
+    )
+    if not all(callable(fn) for fn in exports):
+        return Result("FAIL", "", "mlx_lm top-level exports are incomplete")
+
+    signature = inspect.signature(MLX_LM["load"])
+    for name in ("lazy", "revision"):
+        if name not in signature.parameters:
+            return Result("FAIL", "", f"mlx_lm.load is missing parameter {name!r}")
+    return Result("PASS", "", "top-level mlx_lm exports and load() signature match baseline")
+
+
+def check_mlx_lm_generation_surface() -> Result:
+    stream_signature = inspect.signature(MLX_LM["stream_generate"])
+    batch_signature = inspect.signature(MLX_LM["batch_generate"])
+
+    prompt_annotation = str(stream_signature.parameters["prompt"].annotation)
+    batch_prompts_annotation = str(batch_signature.parameters["prompts"].annotation)
+    if "str" not in prompt_annotation:
+        return Result(
+            "FAIL",
+            "",
+            f"stream_generate prompt annotation changed: {prompt_annotation}",
+        )
+    if "List[int]" not in batch_prompts_annotation:
+        return Result(
+            "FAIL",
+            "",
+            f"batch_generate prompts annotation changed: {batch_prompts_annotation}",
+        )
+
+    fields = set(MLX_LM["GenerationResponse"].__annotations__)
+    expected = {
+        "text",
+        "token",
+        "logprobs",
+        "from_draft",
+        "prompt_tokens",
+        "prompt_tps",
+        "generation_tokens",
+        "generation_tps",
+        "peak_memory",
+        "finish_reason",
+    }
+    if fields != expected:
+        return Result("FAIL", "", f"GenerationResponse fields changed: {sorted(fields)}")
+    return Result(
+        "PASS",
+        "",
+        "generate/stream_generate/batch_generate prompt surfaces and GenerationResponse match baseline",
+    )
+
+
+def check_mlx_lm_quantization_transform() -> Result:
+    transform_awq = MLX_LM["_transform_awq_weights"]
+    bits = 4
+    shifts = mx.array([0, 4, 1, 5, 2, 6, 3, 7], dtype=mx.uint32) * bits
+    unpacked = (mx.arange(64, dtype=mx.uint32).reshape(8, 8) % 16).astype(mx.uint32)
+    packed = ((unpacked << shifts[None, :]).sum(axis=1, keepdims=True)).astype(mx.uint32)
+    weights = {
+        "layer.qweight": packed,
+        "layer.scales": mx.ones((1, 8), dtype=mx.float16),
+    }
+    new_weights, qconf = transform_awq(weights, {"bits": 4, "group_size": 8})
+
+    if sorted(new_weights) != ["layer.biases", "layer.scales", "layer.weight"]:
+        return Result("FAIL", "", f"unexpected AWQ transform keys {sorted(new_weights)}")
+    if qconf != {"group_size": 8, "bits": 4}:
+        return Result("FAIL", "", f"unexpected AWQ quantization config {qconf}")
+    if new_weights["layer.weight"].shape != (8, 1):
+        return Result(
+            "FAIL",
+            "",
+            f"unexpected transformed AWQ weight shape {new_weights['layer.weight'].shape}",
+        )
+    if new_weights["layer.scales"].shape != (8, 1):
+        return Result(
+            "FAIL",
+            "",
+            f"unexpected transformed AWQ scales shape {new_weights['layer.scales'].shape}",
+        )
+    if new_weights["layer.biases"].shape != (8, 1):
+        return Result(
+            "FAIL",
+            "",
+            f"unexpected transformed AWQ biases shape {new_weights['layer.biases'].shape}",
+        )
+    return Result(
+        "PASS",
+        "",
+        "synthetic AutoAWQ/GPTQ packed weights transform into MLX quantized layout",
+    )
+
+
+def check_mlx_lm_attention_mask() -> Result:
+    create_attention_mask = MLX_LM["create_attention_mask"]
+    h = mx.zeros((1, 4, 8), dtype=mx.float32)
+    single = mx.zeros((1, 1, 8), dtype=mx.float32)
+
+    causal = create_attention_mask(h, cache=None)
+    explicit = create_attention_mask(h, cache=None, return_array=True)
+    none_case = create_attention_mask(single, cache=None)
+
+    if causal != "causal":
+        return Result("FAIL", "", f"expected 'causal', got {causal!r}")
+    if explicit.shape != (4, 4):
+        return Result("FAIL", "", f"unexpected explicit mask shape {explicit.shape}")
+    if none_case is not None:
+        return Result("FAIL", "", f"expected None for single-token mask, got {none_case!r}")
+    return Result("PASS", "", "mlx_lm attention mask helper matches current contract")
+
+
+def check_mlx_lm_caches() -> Result:
+    ArraysCache = MLX_LM["ArraysCache"]
+    ConcatenateKVCache = MLX_LM["ConcatenateKVCache"]
+    KVCache = MLX_LM["KVCache"]
+    QuantizedKVCache = MLX_LM["QuantizedKVCache"]
+    RotatingKVCache = MLX_LM["RotatingKVCache"]
+    can_trim_prompt_cache = MLX_LM["can_trim_prompt_cache"]
+    make_prompt_cache = MLX_LM["make_prompt_cache"]
+    trim_prompt_cache = MLX_LM["trim_prompt_cache"]
+
+    kv = KVCache()
+    k = mx.ones((1, 2, 1, 4), dtype=mx.float16)
+    v = mx.ones((1, 2, 1, 4), dtype=mx.float16)
+    k_up, v_up = kv.update_and_fetch(k, v)
+    if kv.offset != 1 or k_up.shape != (1, 2, 1, 4) or v_up.shape != (1, 2, 1, 4):
+        return Result(
+            "FAIL",
+            "",
+            f"unexpected KVCache state: offset={kv.offset}, k={k_up.shape}, v={v_up.shape}",
+        )
+
+    rotating = RotatingKVCache(max_size=8)
+    rotating.update_and_fetch(
+        mx.ones((1, 2, 2, 4), dtype=mx.float16),
+        mx.ones((1, 2, 2, 4), dtype=mx.float16),
+    )
+    if rotating.offset != 2:
+        return Result("FAIL", "", f"unexpected RotatingKVCache offset {rotating.offset}")
+
+    conc = ConcatenateKVCache()
+    conc_k, conc_v = conc.update_and_fetch(k, v)
+    if conc.offset != 1 or conc_k.shape != (1, 2, 1, 4) or conc_v.shape != (1, 2, 1, 4):
+        return Result("FAIL", "", "ConcatenateKVCache did not track concatenated state")
+
+    quant = QuantizedKVCache(bits=8, group_size=32)
+    qk, qv = quant.update_and_fetch(
+        mx.ones((1, 2, 1, 32), dtype=mx.float16),
+        mx.ones((1, 2, 1, 32), dtype=mx.float16),
+    )
+    if quant.offset != 1 or qk[0].shape[-2] != 1 or qv[0].shape[-2] != 1:
+        return Result("FAIL", "", "QuantizedKVCache did not produce quantized state")
+
+    arrays = ArraysCache(size=2)
+    arrays[0] = mx.ones((1, 3, 4), dtype=mx.float16)
+    arrays[1] = mx.ones((1, 3, 5), dtype=mx.float16)
+    if arrays.nbytes <= 0 or arrays.is_trimmable():
+        return Result("FAIL", "", "ArraysCache surface no longer matches baseline")
+
+    class DummyModel:
+        def __init__(self):
+            self.layers = [object(), object(), object()]
+
+    prompt_cache = make_prompt_cache(DummyModel(), max_kv_size=8)
+    if len(prompt_cache) != 3 or type(prompt_cache[0]).__name__ != "RotatingKVCache":
+        return Result(
+            "FAIL",
+            "",
+            f"unexpected prompt cache fallback: len={len(prompt_cache)}, first={type(prompt_cache[0]).__name__}",
+        )
+    if not can_trim_prompt_cache(prompt_cache):
+        return Result("FAIL", "", "RotatingKVCache prompt cache unexpectedly became non-trimmable")
+    if trim_prompt_cache(prompt_cache, 1) != 0:
+        return Result("FAIL", "", "trimming an empty RotatingKVCache should trim 0 tokens")
+    return Result("PASS", "", "KV cache helpers and prompt cache fallback are current")
+
+
+def check_mlx_lm_prompt_cache_roundtrip() -> Result:
+    KVCache = MLX_LM["KVCache"]
+    load_prompt_cache = MLX_LM["load_prompt_cache"]
+    save_prompt_cache = MLX_LM["save_prompt_cache"]
+
+    cache = KVCache()
+    keys = mx.ones((1, 2, 1, 4), dtype=mx.float16)
+    values = mx.full((1, 2, 1, 4), 3, dtype=mx.float16)
+    cache.update_and_fetch(keys, values)
+
+    with tempfile.NamedTemporaryFile(suffix=".safetensors") as handle:
+        save_prompt_cache(handle.name, [cache], metadata={"model": "dummy"})
+        loaded, metadata = load_prompt_cache(handle.name, return_metadata=True)
+
+    loaded_cache = loaded[0]
+    if loaded_cache.offset != 1:
+        return Result("FAIL", "", f"unexpected loaded cache offset {loaded_cache.offset}")
+    if metadata.get("model") != "dummy":
+        return Result("FAIL", "", f"unexpected prompt cache metadata {metadata}")
+    if not arrays_equal(loaded_cache.keys, keys) or not arrays_equal(loaded_cache.values, values):
+        return Result("FAIL", "", "prompt cache tensors changed across save/load")
+    return Result("PASS", "", "prompt caches round-trip through safetensors")
+
+
+def check_local_model_load_and_decode(model_path: str) -> Result:
+    model, tokenizer = MLX_LM["load"](model_path, lazy=True)
+    text = MLX_LM["generate"](
+        model, tokenizer, "Say hi in one word.", max_tokens=1, verbose=False
+    )
+    response = next(
+        MLX_LM["stream_generate"](
+            model, tokenizer, "Say hi in one word.", max_tokens=1
+        )
+    )
+    if not isinstance(text, str):
+        return Result("FAIL", "", f"generate() returned {type(text).__name__}")
+    if not isinstance(response, MLX_LM["GenerationResponse"]):
+        return Result(
+            "FAIL", "", f"stream_generate() yielded {type(response).__name__}"
+        )
+    return Result(
+        "PASS",
+        "",
+        "local model loads with lazy=True, generate() returns text, and stream_generate() yields GenerationResponse",
+    )
+
+
+def check_local_model_generation_loop_internals(model_path: str) -> Result:
+    genmod = importlib.import_module("mlx_lm.generate")
+    default_stream = mx.default_stream(mx.default_device())
+    if genmod.generation_stream == default_stream:
+        return Result("FAIL", "", "mlx_lm generation_stream unexpectedly matches the default stream")
+
+    counts = {"async_eval": 0, "clear_cache": 0}
+    original_async_eval = mx.async_eval
+    original_clear_cache = mx.clear_cache
+
+    def wrapped_async_eval(*args, **kwargs):
+        counts["async_eval"] += 1
+        return original_async_eval(*args, **kwargs)
+
+    def wrapped_clear_cache(*args, **kwargs):
+        counts["clear_cache"] += 1
+        return original_clear_cache(*args, **kwargs)
+
+    model, tokenizer = MLX_LM["load"](model_path, lazy=True)
+    try:
+        mx.async_eval = wrapped_async_eval
+        mx.clear_cache = wrapped_clear_cache
+        _ = MLX_LM["generate"](model, tokenizer, "Say hi.", max_tokens=2, verbose=False)
+    finally:
+        mx.async_eval = original_async_eval
+        mx.clear_cache = original_clear_cache
+
+    if counts["async_eval"] <= 0:
+        return Result("FAIL", "", "generate() did not exercise mx.async_eval in the local model check")
+    if counts["clear_cache"] <= 0:
+        return Result("FAIL", "", "generate() did not exercise mx.clear_cache in the local model check")
+    return Result(
+        "PASS",
+        "",
+        f"mlx_lm generate() used a dedicated stream and exercised async_eval={counts['async_eval']} / clear_cache={counts['clear_cache']}",
+    )
+
+
+def check_local_model_prompt_cache(model_path: str) -> Result:
+    model, tokenizer = MLX_LM["load"](model_path, lazy=True)
+    prompt = mx.array(tokenizer.encode("Hello"), dtype=mx.int32)[None]
+    cache = MLX_LM["make_prompt_cache"](model, max_kv_size=16)
+    _ = model(prompt, cache=cache)
+    mx.eval([c.state for c in cache])
+
+    counts: dict[str, int] = {}
+    for c in cache:
+        counts[type(c).__name__] = counts.get(type(c).__name__, 0) + 1
+    if not counts:
+        return Result("FAIL", "", "local model returned an empty prompt cache")
+    if sum(c.nbytes for c in cache) <= 0:
+        return Result("FAIL", "", "local model prompt cache did not materialize state")
+
+    with tempfile.NamedTemporaryFile(suffix=".safetensors") as handle:
+        MLX_LM["save_prompt_cache"](handle.name, cache, metadata={"model": "local"})
+        loaded, metadata = MLX_LM["load_prompt_cache"](
+            handle.name, return_metadata=True
+        )
+
+    loaded_counts: dict[str, int] = {}
+    for c in loaded:
+        loaded_counts[type(c).__name__] = loaded_counts.get(type(c).__name__, 0) + 1
+    if loaded_counts != counts:
+        return Result(
+            "FAIL",
+            "",
+            f"prompt cache class mix changed across round-trip: {counts} -> {loaded_counts}",
+        )
+    if metadata.get("model") != "local":
+        return Result("FAIL", "", f"unexpected local prompt cache metadata {metadata}")
+    return Result(
+        "PASS",
+        "",
+        f"local model prompt cache round-trips with class mix {counts}",
+    )
+
+
+def check_local_model_batch_generate_edge(model_path: str) -> Result:
+    model, tokenizer = MLX_LM["load"](model_path, lazy=True)
+    prompts = [tokenizer.encode("Hello"), tokenizer.encode("Goodbye")]
+
+    try:
+        MLX_LM["batch_generate"](model, tokenizer, prompts, max_tokens=1, verbose=False)
+    except ZeroDivisionError:
+        pass
+    else:
+        return Result(
+            "FAIL",
+            "",
+            "expected current batch_generate(max_tokens=1) edge case did not reproduce",
+        )
+
+    response = MLX_LM["batch_generate"](
+        model, tokenizer, prompts, max_tokens=2, verbose=False
+    )
+    if len(response.texts) != 2:
+        return Result("FAIL", "", f"unexpected batch_generate result length {len(response.texts)}")
+    return Result(
+        "WARN",
+        "",
+        "local model reproduced the current batch_generate(max_tokens=1) ZeroDivisionError edge case; max_tokens=2 succeeded",
+    )
+
+
+def print_results(results: Iterable[Result]) -> int:
+    results = list(results)
+    counts = {"PASS": 0, "WARN": 0, "FAIL": 0}
+    worst = "PASS"
+
+    for result in results:
+        counts[result.status] += 1
+        if STATUS_ORDER[result.status] > STATUS_ORDER[worst]:
+            worst = result.status
+        print(f"[{result.status}] {result.name}: {result.detail}")
+
+    print()
+    print(
+        "Summary: "
+        f"{counts['PASS']} pass, {counts['WARN']} warn, {counts['FAIL']} fail"
+    )
+    return 1 if worst == "FAIL" else 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate the current MLX / MLX-LM cheat sheet claims.")
+    parser.add_argument(
+        "--model-path",
+        default=os.environ.get("MLX_LM_LOCAL_MODEL"),
+        help="Optional local MLX model path for live mlx-lm load/decode checks.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    checks = [
+        ("mlx version", check_mlx_version),
+        ("default dtypes", check_default_dtypes),
+        ("boolean selection and assignment", check_boolean_selection_and_assignment),
+        ("where/nonzero/argwhere", check_where_nonzero_argwhere_absence),
+        ("helper creation APIs", check_helper_creation_apis),
+        ("indexing surface", check_indexing_surface),
+        ("slice copy and aliasing", check_slice_copy_and_aliasing),
+        ("duplicate updates", check_duplicate_updates),
+        ("index dtype and dynamic slice", check_index_dtype_and_dynamic_slice),
+        ("compile and shapeless", check_compile_and_shapeless),
+        ("compile and fast surface", check_compile_and_fast_surface),
+        ("compile recompilation rules", check_compile_recompilation_rules),
+        ("NumPy interop", check_numpy_interop),
+        ("random contract", check_random_contract),
+        ("out-of-bounds note", check_oob_observation),
+        ("at surface and weight layouts", check_at_surface_and_weight_layouts),
+        ("training surface and optimizer flow", check_training_surface_and_optimizer_flow),
+        ("channels-last surface", check_channels_last_surface),
+        ("stream surface", check_stream_surface),
+        ("metal kernel surface", check_metal_kernel_surface),
+        ("mlx-lm availability/version", require_mlx_lm),
+        ("mlx-lm exports and load signature", check_mlx_lm_exports_and_signature),
+        ("mlx-lm generation surface", check_mlx_lm_generation_surface),
+        ("mlx-lm quantization transform", check_mlx_lm_quantization_transform),
+        ("mlx-lm attention mask", check_mlx_lm_attention_mask),
+        ("mlx-lm caches", check_mlx_lm_caches),
+        ("mlx-lm prompt cache roundtrip", check_mlx_lm_prompt_cache_roundtrip),
+    ]
+    if args.model_path:
+        checks.extend(
+            [
+                (
+                    "local model load and decode",
+                    lambda: check_local_model_load_and_decode(args.model_path),
+                ),
+                (
+                    "local model prompt cache roundtrip",
+                    lambda: check_local_model_prompt_cache(args.model_path),
+                ),
+                (
+                    "local model generation loop internals",
+                    lambda: check_local_model_generation_loop_internals(args.model_path),
+                ),
+                (
+                    "local model batch_generate edge",
+                    lambda: check_local_model_batch_generate_edge(args.model_path),
+                ),
+            ]
+        )
+    results = [run_check(name, fn) for name, fn in checks]
+    return print_results(results)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

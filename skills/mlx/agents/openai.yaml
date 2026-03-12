@@ -1,0 +1,4 @@
+interface:
+  display_name: "MLX"
+  short_description: "Current MLX and MLX-LM workflow"
+  default_prompt: "Use $mlx to validate MLX or MLX-LM code against current source and runtime behavior."

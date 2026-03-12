@@ -7,7 +7,7 @@ no model downloads, no giant benchmarks, and no undocumented conclusions passed
 off as contracts.
 
 Baseline used for this repo revision:
-- MLX v0.31.0
+- MLX v0.31.1
 - MLX-LM v0.31.0
 
 Runtime notes:
@@ -32,7 +32,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-BASELINE_MLX = "0.31.0"
+BASELINE_MLX = "0.31.1"
 BASELINE_MLX_LM = "0.31.0"
 
 STATUS_ORDER = {"PASS": 0, "WARN": 1, "FAIL": 2}
@@ -152,13 +152,23 @@ def check_helper_creation_apis() -> Result:
     if hasattr(mx, "full_like"):
         return Result("FAIL", "", "mx.full_like unexpectedly exists")
 
+    if not hasattr(mx, "bartlett"):
+        return Result("FAIL", "", "mx.bartlett is missing")
+    bartlett = np.array(mx.bartlett(5))
+    if not np.allclose(bartlett, np.bartlett(5)):
+        return Result("FAIL", "", f"mx.bartlett(5) did not match NumPy: {bartlett}")
+
     if arr.nbytes != arr.size * arr.itemsize:
         return Result(
             "FAIL",
             "",
             f"nbytes mismatch: nbytes={arr.nbytes}, size={arr.size}, itemsize={arr.itemsize}",
         )
-    return Result("PASS", "", "nbytes exists; ones_like dtype/full_like match baseline")
+    return Result(
+        "PASS",
+        "",
+        "nbytes exists; ones_like dtype/full_like match baseline; bartlett() matches NumPy",
+    )
 
 
 def check_indexing_surface() -> Result:
@@ -213,6 +223,27 @@ def check_duplicate_updates() -> Result:
     if not arrays_equal(accumulated, mx.array([2, 0, 2, 0, 1], dtype=mx.int32)):
         return Result("FAIL", "", f"unexpected .at.add result: {accumulated}")
     return Result("PASS", "", "direct duplicate writes differ from .at accumulations")
+
+
+def check_bool_assignment_to_low_precision_floats() -> Result:
+    f16 = mx.zeros((2,), dtype=mx.float16)
+    bf16 = mx.zeros((2,), dtype=mx.bfloat16)
+    f16[mx.array([True, False])] = True
+    bf16[mx.array([False, True])] = True
+    mx.eval(f16, bf16)
+
+    if f16.tolist() != [1.0, 0.0]:
+        return Result("FAIL", "", f"unexpected float16 bool assignment result {f16.tolist()}")
+
+    bf16_list = [float(v) for v in bf16.tolist()]
+    if bf16_list != [0.0, 1.0]:
+        return Result("FAIL", "", f"unexpected bfloat16 bool assignment result {bf16_list}")
+
+    return Result(
+        "PASS",
+        "",
+        "bool assignment into float16/bfloat16 stores numeric 1.0/0.0",
+    )
 
 
 def check_index_dtype_and_dynamic_slice() -> Result:
@@ -1003,6 +1034,7 @@ def main() -> int:
         ("indexing surface", check_indexing_surface),
         ("slice copy and aliasing", check_slice_copy_and_aliasing),
         ("duplicate updates", check_duplicate_updates),
+        ("bool assignment to low-precision floats", check_bool_assignment_to_low_precision_floats),
         ("index dtype and dynamic slice", check_index_dtype_and_dynamic_slice),
         ("compile and shapeless", check_compile_and_shapeless),
         ("compile and fast surface", check_compile_and_fast_surface),

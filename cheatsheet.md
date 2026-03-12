@@ -2,9 +2,9 @@
 
 Source-backed baseline:
 
-- `mlx` source tag: `v0.31.0`
+- `mlx` source tag: `v0.31.1`
 - `mlx-lm` source tag: `v0.31.0`
-- Runtime spot checks: March 11, 2026
+- Runtime spot checks: March 12, 2026
 
 Use documented contracts first. If runtime behavior is not documented upstream,
 treat it as unstable unless you verify it again.
@@ -38,6 +38,8 @@ treat it as unstable unless you verify it again.
 - `mx.ones_like(x)` and `mx.zeros_like(x)` exist, but do not accept a `dtype=`
   keyword.
 - There is no `mx.full_like`. Use `mx.full(x.shape, value, dtype)` instead.
+- `mx.bartlett(M)` now exists alongside `mx.hanning`, `mx.hamming`, and
+  `mx.blackman`.
 
 ```python
 import mlx.core as mx
@@ -93,6 +95,8 @@ that avoids data-dependent output shapes entirely.
   `b = a; b[2] = 0` also changes `a`.
 - Slices are copies, not views:
   `b = a[:]` can be mutated without changing `a`.
+- Assigning booleans into floating arrays stores numeric `1.0` / `0.0`.
+  This is fixed for `float16` and `bfloat16` in current MLX.
 - Repeated direct writes to the same index are nondeterministic.
 - Use `.at[...]` when all updates to duplicate indices must be applied.
 

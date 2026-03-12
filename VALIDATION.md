@@ -2,9 +2,9 @@
 
 Baseline for this repo revision:
 
-- `mlx`: `v0.31.0`
+- `mlx`: `v0.31.1`
 - `mlx-lm`: `v0.31.0`
-- Runtime spot checks: March 11, 2026
+- Runtime spot checks: March 12, 2026
 
 The cheat sheet mixes three kinds of statements:
 
@@ -16,10 +16,11 @@ The cheat sheet mixes three kinds of statements:
 
 ## Runtime-Validated by Default
 
-- MLX version floor and current `0.31.0` baseline
+- MLX version floor and current `0.31.1` baseline
 - Literal default dtypes: integer lists -> `int32`, float lists -> `float32`
 - `ones_like` / `zeros_like` reject `dtype=`
 - `full_like` is absent
+- `mx.bartlett(...)` exists and matches NumPy for a representative case
 - `array.nbytes` matches `size * itemsize`
 - Negative indexing, `None`, `...`, `take`, and `take_along_axis`
 - Boolean mask selection fails and boolean mask assignment succeeds
@@ -30,6 +31,7 @@ The cheat sheet mixes three kinds of statements:
 - Aliases share in-place updates
 - Slices are copies, not views
 - Duplicate direct writes differ from `.at.add(...)`
+- Assigning booleans into `float16` / `bfloat16` arrays stores numeric `1.0` / `0.0`
 - `.at` exposes `add`, `subtract`, `multiply`, `divide`, `maximum`, `minimum`
 - `mx.array` does not expose a `backward()` training API
 - `optimizer.update(...)` is the MLX model-update entry point and `optimizer.step` is optimizer state, not a `.step()` method

@@ -5,9 +5,9 @@ behavior.
 
 ## Baseline
 
-- MLX source tag: `v0.31.0` (published February 28, 2026)
+- MLX source tag: `v0.31.1` (published March 12, 2026)
 - MLX-LM source tag: `v0.31.0` (published March 7, 2026)
-- Runtime spot checks performed: March 11, 2026
+- Runtime spot checks performed: March 12, 2026
 
 This repo now targets the current upstream source contracts, not older folklore
 or ad hoc experiments.
@@ -22,6 +22,7 @@ cross-contamination bug. This repo tracks the upstream source tag and installs
 - `validation.py`: correctness-focused verifier for the claims in the cheat sheet
 - `VALIDATION.md`: claim coverage map showing what is runtime-validated, source-validated, or advice
 - `requirements.txt`: baseline dependencies for reproducing the checks
+- `skills/mlx`: discoverable Codex skill for MLX / MLX-LM work
 
 ## Install
 
@@ -49,6 +50,29 @@ MLX_LM_LOCAL_MODEL=/path/to/mlx-model python validation.py
 If a local model path is provided, the validator also checks real `mlx-lm`
 loading, one-step generation, prompt-cache round-trips, and the current
 `batch_generate(max_tokens=1)` edge case.
+
+## Codex Skill
+
+This repo includes a visible Codex skill at [skills/mlx](/Users/caviterginsoy/Coding/mlx-LLM-cheatsheet/skills/mlx/SKILL.md).
+
+That follows the common GitHub repo pattern used by the official
+[`openai/skills`](https://github.com/openai/skills) repository and matches the
+Codex skill installer expectation of a repo path like `skills/<skill-name>`.
+
+Install it from GitHub with:
+
+```bash
+python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo cavit99/mlx-LLM-cheatsheet \
+  --path skills/mlx
+```
+
+Or copy/sync it locally from this repo:
+
+```bash
+mkdir -p ~/.codex/skills/mlx
+rsync -a --delete skills/mlx/ ~/.codex/skills/mlx/
+```
 
 ## Scope
 

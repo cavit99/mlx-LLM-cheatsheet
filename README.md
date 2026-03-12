@@ -9,11 +9,7 @@ behavior.
 - MLX-LM source tag: `v0.31.0` (published March 7, 2026)
 - Python support from current package metadata:
   `mlx 0.31.1` requires `>=3.10` and ships wheels through `cp314`;
-  `mlx-lm 0.31.0` requires `>=3.8`
 - Runtime spot checks performed: March 12, 2026
-
-This repo now targets the current upstream source contracts, not older folklore
-or ad hoc experiments.
 
 Note: the PyPI `mlx-lm==0.31.0` wheel is yanked due to a batched KV cache
 cross-contamination bug. This repo tracks the upstream source tag and installs
@@ -32,8 +28,7 @@ cross-contamination bug. This repo tracks the upstream source tag and installs
 
 Use any isolated Python environment supported by the current MLX baseline. The
 practical floor for this repo is Python `3.10+`, because that is what
-`mlx 0.31.1` requires. The recommended path below uses `uv`, but the repo is
-not tied to a specific operational model.
+`mlx 0.31.1` requires. The recommended path below uses `uv`.
 
 ```bash
 uv sync
@@ -45,14 +40,7 @@ If you already have a dedicated environment, use that instead. The primary
 source of truth is `pyproject.toml` plus `uv.lock`; `requirements.txt` is kept
 as a compatibility fallback for plain `pip` workflows.
 
-Validation for this repo revision was run on Python `3.11.6`, but the repo is
-not intentionally pinned to that exact minor version.
-
-For a plain `pip` fallback inside an environment you already manage:
-
-```bash
-python -m pip install -r requirements.txt
-```
+Validation for this repo revision was run on Python `3.11.6`.
 
 ## Validate
 
@@ -62,12 +50,6 @@ uv run python validation.py
 
 The validator does not download any models. It only checks API surface and
 small tensor behaviors locally.
-
-Optional quality check:
-
-```bash
-uv run ruff check .
-```
 
 Optional live-model validation:
 

@@ -7,6 +7,9 @@ behavior.
 
 - MLX source tag: `v0.31.1` (published March 12, 2026)
 - MLX-LM source tag: `v0.31.0` (published March 7, 2026)
+- Python support from current package metadata:
+  `mlx 0.31.1` requires `>=3.10` and ships wheels through `cp314`;
+  `mlx-lm 0.31.0` requires `>=3.8`
 - Runtime spot checks performed: March 12, 2026
 
 This repo now targets the current upstream source contracts, not older folklore
@@ -21,30 +24,55 @@ cross-contamination bug. This repo tracks the upstream source tag and installs
 - `cheatsheet.md`: current MLX and MLX-LM reference, including memory sizing and profiling guidance
 - `validation.py`: correctness-focused verifier for the claims in the cheat sheet
 - `VALIDATION.md`: claim coverage map showing what is runtime-validated, source-validated, or advice
-- `requirements.txt`: baseline dependencies for reproducing the checks
+- `pyproject.toml` and `uv.lock`: primary project metadata and locked dependency set
+- `requirements.txt`: compatibility fallback for pip-based environments
 - `skills/mlx`: discoverable Codex skill for MLX / MLX-LM work
 
-## Install
+## Environment
+
+Use any isolated Python environment supported by the current MLX baseline. The
+practical floor for this repo is Python `3.10+`, because that is what
+`mlx 0.31.1` requires. The recommended path below uses `uv`, but the repo is
+not tied to a specific operational model.
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+uv sync
+```
+
+`uv` will create and manage the project environment automatically.
+
+If you already have a dedicated environment, use that instead. The primary
+source of truth is `pyproject.toml` plus `uv.lock`; `requirements.txt` is kept
+as a compatibility fallback for plain `pip` workflows.
+
+Validation for this repo revision was run on Python `3.11.6`, but the repo is
+not intentionally pinned to that exact minor version.
+
+For a plain `pip` fallback inside an environment you already manage:
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
 ## Validate
 
 ```bash
-python validation.py
+uv run python validation.py
 ```
 
 The validator does not download any models. It only checks API surface and
 small tensor behaviors locally.
 
+Optional quality check:
+
+```bash
+uv run ruff check .
+```
+
 Optional live-model validation:
 
 ```bash
-MLX_LM_LOCAL_MODEL=/path/to/mlx-model python validation.py
+MLX_LM_LOCAL_MODEL=/path/to/mlx-model uv run python validation.py
 ```
 
 If a local model path is provided, the validator also checks real `mlx-lm`
@@ -62,7 +90,7 @@ Codex skill installer expectation of a repo path like `skills/<skill-name>`.
 Install it from GitHub with:
 
 ```bash
-python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
   --repo cavit99/mlx-LLM-cheatsheet \
   --path skills/mlx
 ```

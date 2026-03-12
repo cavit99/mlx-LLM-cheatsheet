@@ -2,3 +2,6 @@
 __pycache__/
 .DS_Store
 .codex/
+.python-version
+.ruff_cache/
+.pytest_cache/

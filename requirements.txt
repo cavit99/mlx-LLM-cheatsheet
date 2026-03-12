@@ -1,3 +1,5 @@
+# Compatibility fallback for pip-based environments.
+# Source of truth: pyproject.toml and uv.lock.
 mlx==0.31.1
 numpy>=2.0
 git+https://github.com/ml-explore/mlx-lm.git@v0.31.0

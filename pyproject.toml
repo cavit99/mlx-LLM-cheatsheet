@@ -1,0 +1,26 @@
+[project]
+name = "mlx-llm-cheatsheet"
+version = "0.1.0"
+description = "Source-backed MLX and MLX-LM cheat sheet with a lightweight verifier."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx-lm",
+    "mlx==0.31.1",
+    "numpy>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+mlx-lm = { git = "https://github.com/ml-explore/mlx-lm.git", rev = "v0.31.0" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -61,7 +61,9 @@ def arrays_equal(a: mx.array, b: mx.array) -> bool:
 
 
 def compare(actual: str, baseline: str) -> str:
-    to_tuple = lambda s: tuple(int(p) for p in re.findall(r"\d+", s)[:3])
+    def to_tuple(version: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+
     a = to_tuple(actual)
     b = to_tuple(baseline)
     if a < b:

@@ -26,11 +26,15 @@ Re-check release status with:
 - Training uses `nn.value_and_grad(...)`, `optimizer.update(...)`, and explicit `mx.eval(...)`
 - Conv inputs are channels-last: `NLC`, `NHWC`, `NDHWC`
 - Stream APIs are normal MLX surface, not a niche internal detail
+- Prefer top-level memory profiling APIs:
+  `mx.get_active_memory()`, `mx.get_peak_memory()`, `mx.reset_peak_memory()`,
+  `mx.get_cache_memory()`, `mx.clear_cache()`, `mx.device_info()`
 - `mx.bartlett(...)` now exists and matches NumPy semantics
 - `mx.fast.metal_kernel(...)` exists and works as the Python-level fused-kernel path
 - `mx.custom_function` is the custom-gradient hook that pairs with bespoke kernels
 - `mx.metal.start_capture(...)` / `mx.metal.stop_capture()` exist for GPU traces
 - Bool assignment into `float16` / `bfloat16` arrays now stores numeric `1.0` / `0.0`
+- The Python API still has no `mx.full_like`; use `mx.full(...)`
 
 ## MLX-LM
 
@@ -48,6 +52,8 @@ Re-check release status with:
   returns zero-like or garbage values
 - PyPI `mlx-lm==0.31.0` is yanked; prefer the GitHub `v0.31.0` tag or a newer
   non-yanked release
+- `mx.metal.get_active_memory()` and related `mx.metal.*` memory helpers are
+  deprecated aliases for the top-level `mx.*` helpers
 - On a real local MLX model check, `batch_generate(..., max_tokens=1)` reproduced
   a `ZeroDivisionError`, while `max_tokens >= 2` succeeded
 

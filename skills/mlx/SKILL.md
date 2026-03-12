@@ -16,6 +16,7 @@ current upstream behavior, not model memory.
 - Debugging MLX indexing, lazy evaluation, compilation, or stream behavior
 - Deciding when to use stock ops, `mx.fast.*`, `mx.fast.metal_kernel(...)`, or a deeper extension path
 - Profiling or debugging MLX GPU execution with Metal capture hooks
+- Profiling MLX memory usage or allocator/cache behavior on Apple silicon
 - Reviewing MLX-LM model load, cache, prompt-cache, quantization, or generation code
 - Validating local MLX model paths on Apple silicon
 
@@ -80,7 +81,8 @@ gh repo clone ml-explore/mlx-lm /tmp/mlx-lm-upstream -- --depth 1
 Inspect only the files relevant to the question. Typical targets:
 
 - MLX: `docs/src/usage/indexing.rst`, `lazy_evaluation.rst`, `compile.rst`,
-  `numpy.rst`, `python/data_types.rst`, `python/mlx/nn/layers/convolution.py`,
+  `numpy.rst`, `python/data_types.rst`, `python/memory_management.rst`,
+  `python/mlx/nn/layers/convolution.py`,
   `docs/src/dev/custom_metal_kernels.rst`, `docs/src/dev/metal_debugger.rst`,
   `docs/src/dev/extensions.rst`
 - MLX-LM: `mlx_lm/generate.py`, `mlx_lm/utils.py`, `mlx_lm/models/base.py`,
@@ -165,6 +167,8 @@ common MLX-specific failure modes:
 - `shapeless=True` avoids shape-only retracing but can break shape-dependent code.
 - Streams are first-class, and timing without `mx.eval(...)` or
   `mx.synchronize(...)` is often wrong.
+- Memory profiling should use the top-level `mx.get_*_memory()` helpers and
+  `mx.device_info()`, not deprecated `mx.metal.*` aliases.
 - MLX has a real Python-level fused-kernel escape hatch in
   `mx.fast.metal_kernel(...)`.
 

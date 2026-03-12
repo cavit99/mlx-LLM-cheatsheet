@@ -19,7 +19,7 @@ The cheat sheet mixes three kinds of statements:
 - MLX version floor and current `0.31.1` baseline
 - Literal default dtypes: integer lists -> `int32`, float lists -> `float32`
 - `ones_like` / `zeros_like` reject `dtype=`
-- `full_like` is absent
+- Python `full_like` is absent
 - `mx.bartlett(...)` exists and matches NumPy for a representative case
 - `array.nbytes` matches `size * itemsize`
 - Negative indexing, `None`, `...`, `take`, and `take_along_axis`
@@ -52,6 +52,8 @@ The cheat sheet mixes three kinds of statements:
 - MLX `nn.Linear`, `Conv1d`, and `Conv2d` weight layouts match the cheat sheet
 - MLX convolution inputs are channels-last: `NLC`, `NHWC`, and `NDHWC`
 - Core stream APIs exist, `stream=` works on ops, and `mx.new_stream(...)` returns a non-default stream
+- Top-level memory profiling APIs exist: `get_active_memory`, `get_peak_memory`, `reset_peak_memory`, `get_cache_memory`, `clear_cache`, and `device_info`
+- `get_peak_memory()` tracks evaluated allocations and `device_info()` exposes `max_recommended_working_set_size`
 - `mlx_lm` exports `load`, `generate`, `stream_generate`, `batch_generate`, `convert`
 - `mlx_lm.load(...)` supports `lazy=` and `revision=`
 - `stream_generate(...)` and `batch_generate(...)` signatures match the current API
@@ -68,6 +70,7 @@ The cheat sheet mixes three kinds of statements:
 - Implicit evaluation triggers include `print(array)`, `np.array(array)`, `memoryview(array)`, `array.item()`, and save/load paths
 - Out-of-bounds indexing is undefined behavior
 - `float64` is CPU-only
+- `mx.metal.get_active_memory()` / `get_peak_memory()` / `reset_peak_memory()` / `get_cache_memory()` / `device_info()` are deprecated aliases for the top-level helpers
 - Module parameters are created lazily and `mx.eval(model.parameters())` allocates / initializes them
 - Compiled functions should avoid side effects unless state is captured via `inputs=` / `outputs=`
 - Metal capture needs `MTL_CAPTURE_ENABLED=1`, and `MLX_METAL_DEBUG` improves capture readability
@@ -89,6 +92,7 @@ The cheat sheet mixes three kinds of statements:
 - Treat undocumented behavior as unstable, especially out-of-bounds indexing and silent assignment casts
 - Grouped convolution interop needs more than a simple axis permutation because MLX stores `in // groups`
 - Benchmarking without `mx.eval(...)` or `mx.synchronize(...)` often measures enqueue / dispatch rather than full compute
+- Memory profiling without `mx.eval(...)` or `mx.synchronize(...)` often measures queued work rather than materialized allocations
 
 ## Optional Live-Model Validation
 

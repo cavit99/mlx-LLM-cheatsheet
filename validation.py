@@ -20,6 +20,7 @@ Runtime notes:
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import inspect
 import os
@@ -538,6 +539,55 @@ def check_stream_surface() -> Result:
     )
 
 
+def check_memory_profiling_surface() -> Result:
+    required = (
+        "get_active_memory",
+        "get_peak_memory",
+        "reset_peak_memory",
+        "get_cache_memory",
+        "clear_cache",
+        "device_info",
+    )
+    missing = [name for name in required if not hasattr(mx, name)]
+    if missing:
+        return Result("FAIL", "", f"missing top-level memory helpers: {', '.join(missing)}")
+
+    mx.reset_peak_memory()
+    if int(mx.get_peak_memory()) != 0:
+        return Result("FAIL", "", f"peak memory did not reset cleanly: {mx.get_peak_memory()}")
+
+    before_active = int(mx.get_active_memory())
+    arr = mx.ones((1024, 1024), dtype=mx.float32)
+    mx.eval(arr)
+    after_active = int(mx.get_active_memory())
+    peak = int(mx.get_peak_memory())
+    info = mx.device_info()
+
+    if after_active < before_active:
+        return Result(
+            "FAIL",
+            "",
+            f"active memory unexpectedly decreased across an evaluated allocation: {before_active} -> {after_active}",
+        )
+    if peak < after_active:
+        return Result("FAIL", "", f"peak memory {peak} was smaller than active memory {after_active}")
+    if "max_recommended_working_set_size" not in info:
+        return Result("FAIL", "", f"device_info() keys changed: {sorted(info)}")
+
+    del arr
+    gc.collect()
+    mx.clear_cache()
+    cache_bytes = int(mx.get_cache_memory())
+    if cache_bytes != 0:
+        return Result("FAIL", "", f"clear_cache() did not empty cached bytes: {cache_bytes}")
+
+    return Result(
+        "PASS",
+        "",
+        "top-level memory helpers exist, peak tracking works, clear_cache() empties cached bytes, and device_info() exposes max_recommended_working_set_size",
+    )
+
+
 def check_metal_kernel_surface() -> Result:
     if not hasattr(mx, "custom_function"):
         return Result("FAIL", "", "mx.custom_function is missing")
@@ -1046,6 +1096,7 @@ def main() -> int:
         ("training surface and optimizer flow", check_training_surface_and_optimizer_flow),
         ("channels-last surface", check_channels_last_surface),
         ("stream surface", check_stream_surface),
+        ("memory profiling surface", check_memory_profiling_surface),
         ("metal kernel surface", check_metal_kernel_surface),
         ("mlx-lm availability/version", require_mlx_lm),
         ("mlx-lm exports and load signature", check_mlx_lm_exports_and_signature),

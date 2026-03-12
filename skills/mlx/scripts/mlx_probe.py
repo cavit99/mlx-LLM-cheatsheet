@@ -9,6 +9,7 @@ current-behavior check before patching or reviewing code.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import inspect
 import os
@@ -110,6 +111,16 @@ def check_mlx_core() -> Result:
     if [float(v) for v in bf16.tolist()] != [0.0, 1.0]:
         return Result("FAIL", "", f"unexpected bfloat16 bool assignment result {bf16.tolist()}")
 
+    try:
+        _ = mx.ones_like(mx.arange(4), dtype=mx.int32)
+    except TypeError:
+        pass
+    else:
+        return Result("FAIL", "", "ones_like unexpectedly accepted dtype=")
+
+    if hasattr(mx, "full_like"):
+        return Result("FAIL", "", "mx.full_like unexpectedly exists in Python")
+
     if not hasattr(mx, "bartlett"):
         return Result("FAIL", "", "mx.bartlett is missing")
     bartlett = np.array(mx.bartlett(5))
@@ -125,7 +136,7 @@ def check_mlx_core() -> Result:
     return Result(
         "PASS",
         "",
-        "default dtypes, bartlett(), boolean mask limits, low-precision bool assignment, and slice-copy behavior match baseline",
+        "default dtypes, helper-creation limits, bartlett(), boolean mask limits, low-precision bool assignment, and slice-copy behavior match baseline",
     )
 
 
@@ -215,6 +226,55 @@ def check_training_layouts_streams() -> Result:
         return Result("FAIL", "", "new_stream() matched the default stream")
 
     return Result("PASS", "", "training flow, channels-last layouts, and stream APIs match baseline")
+
+
+def check_memory_surface() -> Result:
+    required = (
+        "get_active_memory",
+        "get_peak_memory",
+        "reset_peak_memory",
+        "get_cache_memory",
+        "clear_cache",
+        "device_info",
+    )
+    missing = [name for name in required if not hasattr(mx, name)]
+    if missing:
+        return Result("FAIL", "", f"missing top-level memory helpers: {', '.join(missing)}")
+
+    mx.reset_peak_memory()
+    if int(mx.get_peak_memory()) != 0:
+        return Result("FAIL", "", f"peak memory did not reset cleanly: {mx.get_peak_memory()}")
+
+    before_active = int(mx.get_active_memory())
+    arr = mx.ones((1024, 1024), dtype=mx.float32)
+    mx.eval(arr)
+    after_active = int(mx.get_active_memory())
+    peak = int(mx.get_peak_memory())
+    info = mx.device_info()
+
+    if after_active < before_active:
+        return Result(
+            "FAIL",
+            "",
+            f"active memory unexpectedly decreased across an evaluated allocation: {before_active} -> {after_active}",
+        )
+    if peak < after_active:
+        return Result("FAIL", "", f"peak memory {peak} was smaller than active memory {after_active}")
+    if "max_recommended_working_set_size" not in info:
+        return Result("FAIL", "", f"device_info() keys changed: {sorted(info)}")
+
+    del arr
+    gc.collect()
+    mx.clear_cache()
+    cache_bytes = int(mx.get_cache_memory())
+    if cache_bytes != 0:
+        return Result("FAIL", "", f"clear_cache() did not empty cached bytes: {cache_bytes}")
+
+    return Result(
+        "PASS",
+        "",
+        "top-level memory helpers exist, peak tracking works, clear_cache() empties cached bytes, and device_info() exposes max_recommended_working_set_size",
+    )
 
 
 def check_metal_surface() -> Result:
@@ -446,6 +506,7 @@ def main() -> int:
         ("mlx core", check_mlx_core),
         ("compile rules", check_compile_rules),
         ("training/layouts/streams", check_training_layouts_streams),
+        ("memory surface", check_memory_surface),
         ("metal surface", check_metal_surface),
         ("mlx-lm surface", check_mlx_lm_surface),
     ]

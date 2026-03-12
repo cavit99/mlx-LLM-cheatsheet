@@ -18,7 +18,7 @@ cross-contamination bug. This repo tracks the upstream source tag and installs
 
 ## Files
 
-- `cheatsheet.md`: current MLX and MLX-LM reference
+- `cheatsheet.md`: current MLX and MLX-LM reference, including memory sizing and profiling guidance
 - `validation.py`: correctness-focused verifier for the claims in the cheat sheet
 - `VALIDATION.md`: claim coverage map showing what is runtime-validated, source-validated, or advice
 - `requirements.txt`: baseline dependencies for reproducing the checks
@@ -78,5 +78,6 @@ rsync -a --delete skills/mlx/ ~/.codex/skills/mlx/
 
 - Official MLX semantics from upstream docs and source
 - Current MLX-LM implementation patterns that matter for LLM code
+- Current top-level MLX memory profiling APIs and Apple silicon working-set guidance
 - Explicit separation between documented contracts and observed-but-fragile
   behavior

@@ -35,9 +35,10 @@ treat it as unstable unless you verify it again.
   `float64`.
 - `float64` is CPU-only. Using it on GPU-backed operations is not supported.
 - `array.nbytes` exists and is useful for model/cache sizing.
-- `mx.ones_like(x)` and `mx.zeros_like(x)` exist, but do not accept a `dtype=`
-  keyword.
-- There is no `mx.full_like`. Use `mx.full(x.shape, value, dtype)` instead.
+- Python `mx.ones_like(x)` and `mx.zeros_like(x)` exist, but do not accept a
+  `dtype=` keyword.
+- The Python API has no `mx.full_like`, even though the C++ core defines
+  `full_like`. Use `mx.full(x.shape, value, dtype)` instead.
 - `mx.bartlett(M)` now exists alongside `mx.hanning`, `mx.hamming`, and
   `mx.blackman`.
 
@@ -457,14 +458,34 @@ it against `mx.device_info()["max_recommended_working_set_size"]`.
 That is the right mental model for "will this fit comfortably" checks on Apple
 silicon.
 
+### Runtime Memory Profiling
+
+- Prefer the top-level memory APIs:
+  `mx.get_active_memory()`, `mx.get_peak_memory()`, `mx.reset_peak_memory()`,
+  `mx.get_cache_memory()`, `mx.clear_cache()`, and `mx.device_info()`.
+- `mx.device_info()["max_recommended_working_set_size"]` is the practical
+  working-set ceiling to watch on Apple silicon.
+- Because MLX is lazy, put `mx.eval(...)` or `mx.synchronize(...)` around the
+  region you want to measure.
+- `mx.metal.get_active_memory()` and related `mx.metal.*` memory helpers still
+  exist as compatibility aliases, but they are deprecated. Prefer the top-level
+  functions.
+
+```python
+mx.reset_peak_memory()
+y = model(x)
+mx.eval(y)
+print(mx.get_active_memory(), mx.get_peak_memory())
+```
+
 ## Missing or Easy to Hallucinate Today
 
 - No boolean mask selection
 - No `mx.nonzero`
 - No `mx.argwhere`
 - No single-argument `mx.where`
-- No `mx.full_like`
-- No `dtype=` kwarg for `mx.ones_like` / `mx.zeros_like`
+- No Python `mx.full_like`
+- No Python `dtype=` kwarg for `mx.ones_like` / `mx.zeros_like`
 - Out-of-bounds behavior is not a stable contract
 - Duplicate direct writes are not safe accumulation
 
@@ -476,6 +497,7 @@ silicon.
 - [MLX function transforms docs](https://github.com/ml-explore/mlx/blob/main/docs/src/usage/function_transforms.rst)
 - [MLX NumPy and framework interop docs](https://github.com/ml-explore/mlx/blob/main/docs/src/usage/numpy.rst)
 - [MLX data types docs](https://github.com/ml-explore/mlx/blob/main/docs/src/python/data_types.rst)
+- [MLX memory management docs](https://github.com/ml-explore/mlx/blob/main/docs/src/python/memory_management.rst)
 - [MLX custom Metal kernels docs](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/custom_metal_kernels.rst)
 - [MLX Metal debugger docs](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/metal_debugger.rst)
 - [MLX custom extensions docs](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/extensions.rst)
